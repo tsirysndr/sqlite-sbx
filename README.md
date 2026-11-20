@@ -34,7 +34,7 @@ same code and commands.
 
 | What | Why |
 | --- | --- |
-| [bsdkrun](https://github.com/tsirysndr/bsdkrun#install) 0.12 or newer | runs the VM and the ZFS volume (`brew install tsirysndr/tap/bsdkrun`) |
+| [bsdkrun](https://github.com/tsirysndr/bsdkrun#install) 0.12.1 or newer | runs the VM and the ZFS volume (`brew install tsirysndr/tap/bsdkrun`) |
 | macOS on Apple Silicon, or Linux with KVM | what bsdkrun supports |
 | Node.js 22 or newer | runs the tool, drizzle-kit and Studio |
 
@@ -217,3 +217,36 @@ drizzle dialect. `Sbx.App`, `Sbx.Cli`, `Sbx.Native`, `Sbx.State` and
 `Sbx.Profile` are shared verbatim with postgres-sbx and mariadb-sbx.
 
 MIT license.
+
+## CI and releases
+
+Local test commands require Bun in addition to Node.js and the PureScript tools.
+
+GitHub Actions runs PureScript unit tests, Bun CI checks, and live Linux
+sandbox tests on Ubuntu with KVM through the custom `.fluentci/test` module.
+The live suite connects with the host database driver, checks port forwarding,
+ZFS branch isolation, data persistence across restarts, and cleanup. Command
+output streams continuously, with a heartbeat for long operations; diagnostics
+are uploaded even on failure. Live tests require KVM and are never skipped.
+
+```sh
+npm ci
+npm test
+npm run build:bin
+npm run test:e2e                # installed bsdkrun >= 0.12.1 and Docker CLI
+fluentci run test unit          # FluentCI 0.17.8
+fluentci run --workflow test    # Ubuntu x86_64, sudo and /dev/kvm; installs bsdkrun
+```
+
+The workflows use `setup-fluentci@next` with a pinned CLI and the locked
+`setup-purescript@v0.2.0` module for PureScript, Spago, Node and Bun. CI
+orchestration, installation checks, release validation and cleanup live in
+`src/Ci` as PureScript; Node FFI supplies process, filesystem and driver calls.
+
+Pushing a version tag such as `v0.1.0` triggers release tests, then builds
+standalone binaries for macOS ARM64, Linux x86_64 and Linux ARM64. The release
+job verifies the tag against `package.json` and the embedded CLI version,
+checks executable architectures, and uploads three `.tar.gz` archives and
+`SHA256SUMS` to GitHub Releases. The Release workflow can also be dispatched
+manually with an existing matching tag. Publishing uses the workflow's
+`GITHUB_TOKEN`; no additional repository secret is required.

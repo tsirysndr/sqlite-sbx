@@ -1,0 +1,9 @@
+node_modules/
+dist/
+output/
+.spago/
+build/
+lib/
+*.res.mjs
+.sdk/
+.fluentci/

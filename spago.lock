@@ -6,6 +6,7 @@
         "core": {
           "dependencies": [
             "aff",
+            "argonaut-core",
             "arrays",
             "bsdkrun",
             "console",
@@ -22,6 +23,7 @@
             "nullable",
             "optparse",
             "prelude",
+            "refs",
             "strings",
             "transformers",
             "tuples"

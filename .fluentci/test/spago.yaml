@@ -1,0 +1,18 @@
+package:
+  name: sqlite-sbx-ci
+  dependencies:
+    - aff
+    - arrays
+    - console
+    - effect
+    - either
+    - fluentci
+    - maybe
+    - prelude
+    - tuples
+workspace:
+  packageSet:
+    registry: 81.11.0
+  extraPackages:
+    fluentci:
+      path: .sdk/purescript

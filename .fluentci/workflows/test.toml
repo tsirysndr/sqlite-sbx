@@ -1,0 +1,17 @@
+id = "test"
+name = "Unit and live sandbox tests"
+enabled = true
+
+[on]
+manual = true
+
+[on.push]
+branches = ["main"]
+
+[on.pull_request]
+
+[[steps]]
+name = "Install bsdkrun, test and boot the sandbox"
+module = "test"
+command = "all"
+wasm = true

@@ -1,0 +1,6 @@
+[[modules]]
+name = "test"
+path = ".fluentci/test"
+sdk = "purescript"
+runtime = "component"
+version = "0.1.0"

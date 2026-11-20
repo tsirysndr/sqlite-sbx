@@ -1,0 +1,37 @@
+name: Set up and build sqlite-sbx
+description: Install the pinned FluentCI PureScript toolchain and build the checkout.
+runs:
+  using: composite
+  steps:
+    - uses: fluentci-io/setup-fluentci@next
+      with:
+        version: v0.17.8
+    - name: Install PureScript runtime libraries
+      shell: bash
+      run: |
+        sudo -n apt-get update
+        sudo -n apt-get install -y --no-install-recommends libgmp10 libtinfo6
+    - name: Cache package downloads
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.npm
+          ~/.cache/spago-nodejs
+          .spago
+        key: sqlite-sbx-${{ runner.os }}-${{ hashFiles('package-lock.json', 'spago.lock', '.fluentci/test/package-lock.json', '.fluentci/test/spago.lock') }}
+        restore-keys: sqlite-sbx-${{ runner.os }}-
+    - name: Set up PureScript, Spago, Node and Bun with FluentCI
+      shell: bash
+      run: |
+        mkdir -p .fluentci
+        fluentci --check-update=false run --frozen-lockfile setup-purescript@v0.2.0 setup \
+          --version 0.15.16 --spago-version 1.0.5 \
+          --node-version 24.22.2 --bun-version 1.4.3 > .fluentci/setup.json
+    - name: Bootstrap and build PureScript CI code
+      shell: bash
+      env:
+        BSDKRUN_NO_AUTO_INSTALL: '1'
+      run: node bin/bootstrap-ci.mjs .fluentci/setup.json
+    - name: Export the validated toolchain environment
+      shell: bash
+      run: node bin/ci.js export-env .fluentci/setup.json

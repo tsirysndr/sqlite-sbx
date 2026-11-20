@@ -1,0 +1,46 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Source ref to test (used by releases)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Unit and live KVM / SQLite/libSQL / ZFS tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BSDKRUN_NO_AUTO_INSTALL: '1'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.ref }}
+      - uses: ./.github/actions/setup-project
+      - name: Run the custom FluentCI test module
+        run: fluentci --check-update=false run --workflow test
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .fluentci/test-logs/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

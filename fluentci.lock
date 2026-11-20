@@ -1,0 +1,36 @@
+{
+  "lockfileVersion": 1,
+  "modules": {},
+  "packages": {
+    "@fluentci.io/setup-purescript@0.2.0": {
+      "registry": "https://api.fluentci.io",
+      "name": "setup-purescript",
+      "version": "0.2.0",
+      "author": "did:plc:cukdxxemtwuxspaiurk2xsfz",
+      "url": "https://modules.fluentci.io/fluentci.io/setup-purescript/v0.2.0/setup-purescript.wasm",
+      "sha256": "3b4af288d28e01afde19b3bc11cddb5903c5694eada08592a3a7f73078c01adf",
+      "uri": "at://did:plc:cukdxxemtwuxspaiurk2xsfz/io.fluentci.plugin/setup-purescript-0.2.0",
+      "cid": "bafyreifs7nxjcr6anird4b4k57u36eeueqqwmg7vvl2giynkc5isawgibe",
+      "repository": "https://tangled.org/fluentci.io/modules",
+      "readme_url": "https://raw.githubusercontent.com/fluentci-io/modules/refs/heads/main/setup/purescript/README.md",
+      "topics": [
+        "purescript",
+        "spago",
+        "nodejs",
+        "bun",
+        "setup",
+        "ci",
+        "toolchain"
+      ],
+      "os": [
+        "linux",
+        "macos"
+      ],
+      "arch": [
+        "x86_64",
+        "aarch64"
+      ]
+    }
+  },
+  "git": {}
+}

@@ -5,3 +5,10 @@ output-es/
 .psc-ide-port
 *.log
 dist/
+.fluentci/tools/
+.fluentci/test-logs/
+.fluentci/dependencies/
+fluentci_modules/
+.fluentci/workflows/.lock
+
+.fluentci/setup.json

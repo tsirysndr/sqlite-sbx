@@ -13,9 +13,12 @@
   ],
   "scripts": {
     "build": "spago build",
-    "test": "spago test",
+    "test": "spago test && npm run test:cli",
     "prepare": "spago build",
-    "build:bin": "spago build && mkdir -p dist && bun build --compile --minify bin/sqlite-sbx.js --outfile dist/sqlite-sbx"
+    "build:bin": "spago build && node bin/ci.js build-binary",
+    "test:cli": "bun test --timeout 120000 test/*.test.mjs",
+    "test:e2e": "bun test --timeout 1800000 ./test/live.e2e.mjs",
+    "build:release": "node bin/ci.js release"
   },
   "dependencies": {
     "@bsdkrun/sdk": "^0.8.0",

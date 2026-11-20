@@ -19,7 +19,7 @@ sqlite-sbx checkout main           # back to the untouched data
 sqlite-sbx branch -d feature       # done with it
 ```
 
-One sandbox per tool: a VM named `sqlite-sbx`, a ZFS volume named `sqlite-sbx`
+One parent sandbox per tool, with parallel branch instances: a VM named `sqlite-sbx`, a ZFS volume named `sqlite-sbx`
 (the data), a plain volume `sqlite-sbx-rootfs` (what provisioning installs),
 and a small state file under `~/.config/sqlite-sbx`. Studio and drizzle-kit run
 on the host and talk to sqld over a forwarded port; the file-based tools run in
@@ -132,7 +132,7 @@ ZFS clones: forking is instant and costs nothing until the branches diverge.
 
 ```sh
 sqlite-sbx branch                   # list; * marks the mounted one (also: branch ls)
-sqlite-sbx branch staging           # fork the current branch (no switch)
+sqlite-sbx branch staging           # fork and start a parallel instance
 sqlite-sbx branch hotfix --from main
 sqlite-sbx checkout staging         # stop, remount, start
 sqlite-sbx checkout -b try-this     # fork and switch in one go
@@ -215,6 +215,52 @@ drizzle dialect. `Sbx.App`, `Sbx.Cli`, `Sbx.Native`, `Sbx.State` and
 `Sbx.Profile` are shared verbatim with postgres-sbx and mariadb-sbx.
 
 MIT license.
+
+## Parallel branches
+
+`sqlite-sbx branch NAME` clones the data with ZFS copy-on-write and starts a
+parallel instance. The original keeps running and remains selected. Forks
+inherit the source's OS, version, database and credentials; later writes stay
+inside their own dataset. You can fork a fork with `--from`.
+
+```sh
+sqlite-sbx branch feature
+sqlite-sbx branch experiment --from feature
+sqlite-sbx branch staging --port 18080
+sqlite-sbx --branch feature url
+sqlite-sbx --branch feature status
+sqlite-sbx --branch feature stop
+sqlite-sbx --branch feature start
+sqlite-sbx checkout feature       # select its server; the others keep running
+sqlite-sbx checkout main
+sqlite-sbx branch -d experiment   # stop its instance and delete its dataset
+```
+
+The allocator skips occupied host ports and ports reserved by stopped instances.
+BSD server forks also check guest listeners. `--port` selects an explicit port;
+collisions fail before a new dataset is created. A stopped fork retains its
+port, and a busy port on restart is reported rather than silently connecting
+to another service. Put the global `--branch NAME` option **before** the command
+to target an instance without changing your selection.
+
+Linux instances are separate containers in the shared Docker VM, each mounting
+only its own dataset. FreeBSD/NetBSD instances use separate PostgreSQL or MariaDB
+processes inside the existing BSD VM, with separate data directories, ports,
+PID files, sockets and logs. One VM owns the ZFS pool: the disk is never imported
+into multiple VMs at once. Platform support is unchanged: DuckDB on BSD remains
+embedded file access, and SQLite's available engines remain Linux-only.
+
+`checkout` selects an existing parallel instance; for branches without an
+instance it retains the original parent-server mount-switching behavior.
+`checkout -b NAME` retains that behavior too. `branch` lists datasets and parallel
+instances with their status and ports. `branch -d NAME` removes only that fork;
+`destroy` removes the parent sandbox and all its parallel instances. A failed
+fork startup retains its data and settings so `--branch NAME start` can retry.
+
+Snapshots of running databases are crash-consistent. The fork performs normal
+WAL/redo recovery on startup; it does not copy the source process's locks or run
+a second server over the same writable directory. This provides independent
+data, not a security boundary between processes sharing a BSD VM.
 
 ## CI and releases
 

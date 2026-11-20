@@ -1,3 +1,4 @@
+import * as SDK from "@bsdkrun/sdk";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -95,3 +96,14 @@ export const colorOutput = () => Boolean(process.stdout.isTTY) && !process.env.N
 export const ansi = code => text => `\x1b[${code}m${text}\x1b[0m`;
 
 export const sha256 = text => createHash("sha256").update(text).digest("hex");
+
+// Generic SDK bridge: keeps preflight library paths, binary resolution,
+// cancellation and output forwarding identical to other SDK operations.
+export const runBsdkrunImpl = args => async(async signal => {
+  const result = await SDK.runCli(args, {
+    signal,
+    onStdout: chunk => process.stdout.write(chunk),
+    onStderr: chunk => process.stderr.write(chunk),
+  });
+  return result.exitCode;
+});

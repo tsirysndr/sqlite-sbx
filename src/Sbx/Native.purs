@@ -82,3 +82,9 @@ foreign import ansi :: String -> String -> String
 
 -- | Hex SHA-256 of a string.
 foreign import sha256 :: String -> String
+
+-- | Run literal bsdkrun arguments through the SDK with streamed output.
+runBsdkrun :: Array String -> Aff Int
+runBsdkrun = toAff <<< runBsdkrunImpl
+
+foreign import runBsdkrunImpl :: Array String -> Async Int

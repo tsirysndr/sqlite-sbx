@@ -1,16 +1,17 @@
 module Test.Main where
 
 import Prelude
-import Bsdkrun.Options as Options
 import Effect (Effect)
 import Effect.Console (log)
 import Effect.Exception (throw)
 import Sbx.Sqlite (profile)
 import Data.Maybe (Maybe(..))
+import Sbx.Engine (runtimeVersionAllowed)
 import Sbx.Profile (Os(..))
 
 main :: Effect Unit
 main = do
+  unless (runtimeVersionAllowed "bsdkrun 0.12.1" && not (runtimeVersionAllowed "bsdkrun 0.12.0")) $ throw "image-store runtime requirement"
   let c = profile.defaults
   unless (profile.url "latest" c 8080 == "http://127.0.0.1:8080") $ throw "url"
   unless (profile.image "latest" == "ghcr.io/tursodatabase/libsql-server:latest" && profile.image "debian:bookworm" == "debian:bookworm" && profile.image "turso" == "sqlite-sbx-tools") $ throw "image"

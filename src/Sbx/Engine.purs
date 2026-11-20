@@ -6,6 +6,7 @@ module Sbx.Engine
   ( mountPoint
   , containerName
   , ensureEngine
+  , runtimeVersionAllowed
   , engineRunning
   , ensureAttached
   , detachVolume
@@ -19,10 +20,12 @@ module Sbx.Engine
   ) where
 
 import Prelude
+import Bsdkrun.Host as Host
 import Bsdkrun.Docker as Docker
 import Bsdkrun.Types (DockerContainer, ZfsVolumeInfo)
 import Bsdkrun.Zfs as Zfs
 import Control.Monad.Error.Class (throwError)
+import Data.Int as Int
 import Data.Array as Array
 import Data.Foldable (for_)
 import Data.Maybe (Maybe(..), fromMaybe, isNothing, maybe)
@@ -52,6 +55,18 @@ containerName p = p.tool
 engineRunning :: Aff Boolean
 engineRunning = Docker.status <#> _.running
 
+-- | New image stores need the ext4 zeroout fix in bsdkrun 0.12.1.
+runtimeVersionAllowed :: String -> Boolean
+runtimeVersionAllowed raw = fromMaybe false do
+  let version = fromMaybe (String.trim raw) (String.stripPrefix (String.Pattern "bsdkrun ") (String.trim raw))
+  case String.split (String.Pattern ".") version of
+    [ major, minor, patch ] -> do
+      ma <- Int.fromString major
+      mi <- Int.fromString minor
+      pa <- Array.head (String.split (String.Pattern "-") patch) >>= Int.fromString
+      pure (ma > 0 || (ma == 0 && (mi > 12 || (mi == 12 && pa >= 1))))
+    _ -> Nothing
+
 -- | The engine up: created with room for a few databases the first time,
 -- | resumed as it is afterwards (`bsdkrun docker start --cpus/--mem` sizes
 -- | it; the tools do not).
@@ -60,11 +75,25 @@ ensureEngine = do
   st <- Docker.status
   unless st.running do
     say
-      ( if isNothing (toMaybe st.machineId) then "Creating the Docker engine VM '" <> Docker.machineName <> "' (2 vCPU, 2048 MiB; shared by every Linux sandbox) ..."
+      ( if isNothing (toMaybe st.machineId) then "Creating the Docker engine VM '" <> Docker.machineName <> "' (2 vCPU, 2048 MiB, 20G image store; shared by every Linux sandbox) ..."
         else "Starting the Docker engine VM '" <> Docker.machineName <> "' ..."
       )
-    -- Published ports land on the host's loopback only.
-    void (Docker.start { cpus: 2, mem: 2048, publishBind: Just "127.0.0.1" })
+    -- Restarting a live proxy loses its record of existing gvproxy forwards.
+    -- Reuse running engines; App verifies the resulting host listener.
+    if isNothing (toMaybe st.machineId) then do
+      version <- Host.version
+      unless (runtimeVersionAllowed version) $
+        throwError (error ("creating a Docker image store requires bsdkrun >= 0.12.1; found " <> String.trim version))
+      -- Let bsdkrun initialize and mount its own image store. Native overlay
+      -- snapshots need ext4 rather than the VM's virtio-fs root on Linux.
+      -- Only choose a disk size for a new VM; existing engines keep their data.
+      code <- Native.runBsdkrun
+        [ "docker", "start", "--cpus", "2", "--mem", "2048"
+        , "--publish-bind", "127.0.0.1", "--disk-size", "20G"
+        ]
+      unless (code == 0) $ throwError (error "starting the Docker engine failed")
+    else
+      void (Docker.start { cpus: 2, mem: 2048, publishBind: Just "127.0.0.1" })
 
 heldByEngine :: ZfsVolumeInfo -> Boolean
 heldByEngine vol = Array.any (\a -> toMaybe a.machineName == Just Docker.machineName) vol.attachedTo

@@ -1,0 +1,7 @@
+node_modules/
+output/
+output-es/
+.spago/
+.psc-ide-port
+*.log
+dist/

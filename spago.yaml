@@ -1,0 +1,38 @@
+package:
+  name: sqlite-sbx
+  dependencies:
+    - aff
+    - arrays
+    - bsdkrun
+    - console
+    - control
+    - datetime
+    - effect
+    - either
+    - exceptions
+    - foldable-traversable
+    - foreign-object
+    - integers
+    - maybe
+    - node-process
+    - nullable
+    - optparse
+    - prelude
+    - strings
+    - transformers
+    - tuples
+  test:
+    main: Test.Main
+    dependencies:
+      - console
+workspace:
+  packageSet:
+    registry: 77.0.0
+  extraPackages:
+    bsdkrun:
+      # The bsdkrun PureScript SDK. Point this at a sibling checkout while
+      # developing, or at the repository once the ZFS/shell additions are
+      # pushed:
+      #   git: https://github.com/tsirysndr/bsdkrun-purescript.git
+      #   ref: <tag or commit>
+      path: ../bsdkrun-purescript

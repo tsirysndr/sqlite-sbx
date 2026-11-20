@@ -1,0 +1,30 @@
+{
+  "name": "sqlite-sbx",
+  "version": "0.1.0",
+  "description": "SQLite (libSQL server) in a bsdkrun microVM, with ZFS-branched data and Drizzle Studio",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "sqlite-sbx": "bin/sqlite-sbx.js"
+  },
+  "files": [
+    "bin",
+    "output"
+  ],
+  "scripts": {
+    "build": "spago build",
+    "test": "spago test",
+    "prepare": "spago build",
+    "build:bin": "spago build && mkdir -p dist && bun build --compile --minify bin/sqlite-sbx.js --outfile dist/sqlite-sbx"
+  },
+  "dependencies": {
+    "@bsdkrun/sdk": "^0.8.0",
+    "@libsql/client": "^0.18.0",
+    "drizzle-kit": "^0.31.11",
+    "drizzle-orm": "^0.45.4"
+  },
+  "devDependencies": {
+    "purescript": "^0.15.16",
+    "spago": "^1.0.5"
+  }
+}

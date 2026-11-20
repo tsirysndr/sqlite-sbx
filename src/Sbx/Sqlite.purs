@@ -1,11 +1,19 @@
--- | SQLite has no server, so the sandbox runs libSQL server (`sqld`, Turso's
--- | SQLite fork) over the data branch: Drizzle Studio and drizzle-kit on the
--- | host reach it over HTTP with the `turso` dialect, and `litecli`/`sqlite3`
--- | open the file. On Linux that is the official libsql-server image as a
--- | container in the shared Docker engine, with the CLIs in a small helper
--- | image built once in the engine (the server image has none). On FreeBSD
--- | and NetBSD there is no sqld, so those guests only offer the file and the
--- | CLIs.
+-- | SQLite has no server of its own, so the sandbox offers two engines over
+-- | the data branch, chosen by the version argument:
+-- |
+-- | - `latest` (the default) or any other tag: the official libSQL server
+-- |   image (`sqld`, Turso's SQLite fork) as a container in the shared Docker
+-- |   engine. Drizzle Studio and drizzle-kit reach it over HTTP with the
+-- |   `turso` dialect; `sqlite3` and `litecli` open the file next to it.
+-- | - `turso`: Turso Database, Turso's from-scratch rewrite of SQLite, and
+-- |   `sqlite3`: plain SQLite. Both are in-process engines with no network
+-- |   server, so the container only holds the branch and the shell
+-- |   (`tursodb` or `sqlite3`) and `litecli` open the file; `studio` and
+-- |   `drizzle` refuse.
+-- |
+-- | The CLIs live in a small helper image built in the engine once (the
+-- | libsql-server image ships none); in the serverless modes that image is
+-- | the container itself. Linux only.
 module Sbx.Sqlite (profile) where
 
 import Prelude
@@ -13,69 +21,72 @@ import Data.Maybe (Maybe(..))
 import Data.String as String
 import Data.Tuple.Nested ((/\))
 import Foreign.Object as Object
-import Sbx.Profile (ClientCmd(..), FancyCmd(..), Os(..), Profile, shellQuote, withBsdPath)
+import Sbx.Profile (ClientCmd(..), FancyCmd(..), Profile)
+
+-- | The versions that select an in-process engine instead of libSQL server.
+turso :: String
+turso = "turso"
+
+sqlite3 :: String
+sqlite3 = "sqlite3"
+
+serverless :: String -> Boolean
+serverless v = v == turso || v == sqlite3
+
+toolsImage :: String
+toolsImage = "sqlite-sbx-tools"
+
+dataDir :: String
+dataDir = "/var/lib/sqlite"
 
 profile :: Profile
 profile =
   { tool: "sqlite-sbx"
-  , product: "SQLite (libSQL server)"
+  , product: "SQLite"
+  , serves: not <<< serverless
   , guestPort: 8080
   , defaultTag: "latest"
-  , image: \tag -> if String.contains (String.Pattern "/") tag || String.contains (String.Pattern ":") tag then tag else "ghcr.io/tursodatabase/libsql-server:" <> tag
+  , image: \tag ->
+      if serverless tag then toolsImage
+      else if String.contains (String.Pattern "/") tag || String.contains (String.Pattern ":") tag then tag
+      else "ghcr.io/tursodatabase/libsql-server:" <> tag
+  , versionNote: ", or an in-process engine with no server (no studio/drizzle): `turso` for Turso Database (its tursodb shell over the file) or `sqlite3` for plain SQLite"
+  , linuxOnly: true
   , hasCredentials: false
   , defaults: { user: "", password: "", db: "sqlite" }
-  , dataDir: case _ of
-      Linux -> "/var/lib/sqld"
-      FreeBSD -> "/var/db/sqlite"
-      NetBSD -> "/var/db/sqlite"
+  , dataDir: const dataDir
   , rootfsVolume: false
-  -- Room for sqlite3 and litecli (python) on a BSD root disk.
-  , rootDisk: case _ of
-      Linux -> Nothing
-      _ -> Just "8G"
+  , rootDisk: const Nothing
   , tools: Just
-      { image: "sqlite-sbx-tools"
+      { image: toolsImage
       , dockerfile: String.joinWith "\n"
-          [ "FROM alpine:3.21"
-          , "RUN apk add --no-cache sqlite py3-pip && pip install --no-cache-dir --break-system-packages litecli"
+          [ "FROM debian:bookworm-slim"
+          , "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils sqlite3 pipx && rm -rf /var/lib/apt/lists/* \\"
+          , " && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install litecli \\"
+          , " && curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tursodatabase/turso/releases/latest/download/turso_cli-installer.sh | sh \\"
+          , " && install -m 755 /root/.turso/tursodb /usr/local/bin/tursodb && rm -rf /root/.turso"
           , ""
           ]
       }
   -- sqld keeps the database under its --db-path: one directory per database
-  -- name, on the branch.
-  , env: \c -> Object.fromFoldable [ "SQLD_DB_PATH" /\ ("/var/lib/sqld/" <> c.db), "SQLD_HTTP_LISTEN_ADDR" /\ "0.0.0.0:8080" ]
-  , command: Nothing
-  , provision: case _ of
-      Linux -> Nothing
-      FreeBSD -> Just (bsd "pkg install -y sqlite3 py311-litecli" "pkg info -e sqlite3 >/dev/null 2>&1" "/usr/local/bin")
-      NetBSD -> Just (bsd "pkgin -y install sqlite3 py312-litecli" "pkg_info -qe sqlite3" "/usr/pkg/bin")
-  , ready: \os c -> case os of
-      Linux -> [ "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080" ]
-      _ -> [ "sh", "-c", "test -f " <> shellQuote (bsdFile c.db) ]
-  , client: Guest \os c -> withBsdPath ("sqlite3 " <> shellQuote (file os c.db))
+  -- name, on the branch. Harmless for the turso container.
+  , env: \c -> Object.fromFoldable [ "SQLD_DB_PATH" /\ (dataDir <> "/" <> c.db), "SQLD_HTTP_LISTEN_ADDR" /\ "0.0.0.0:8080" ]
+  -- An in-process engine has nothing to serve: the container idles over the branch.
+  , command: \v -> if serverless v then Just [ "sleep", "infinity" ] else Nothing
+  , provision: const Nothing
+  , ready: \_ v _ -> if serverless v then [ "sh", "-c", "test -d " <> dataDir ] else [ "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080" ]
+  , client: Guest \_ v c -> [ if v == turso then "tursodb" else "sqlite3", file v c.db ]
   , clientName: "sqlite3"
-  , fancy: { name: "litecli", cmd: GuestTool \os c -> withBsdPath ("litecli " <> shellQuote (file os c.db)) }
-  , url: \_ port -> "http://127.0.0.1:" <> show port
-  , studioSupported: eq Linux
+  , clientAliases: [ "tursodb" ]
+  , fancy: { name: "litecli", cmd: GuestTool \_ v c -> [ "litecli", file v c.db ] }
+  , url: \v c port -> if serverless v then "file " <> file v c.db <> " in the container (no server)" else "http://127.0.0.1:" <> show port
+  , studioSupported: \_ v -> not (serverless v)
   , dialect: "turso"
   , driver: "@libsql/client"
   , migrations: Nothing
   }
 
--- | Where the SQLite file is: sqld keeps it inside its database directory.
-file :: Os -> String -> String
-file os db = case os of
-  Linux -> "/var/lib/sqld/" <> db <> "/dbs/default/data"
-  _ -> bsdFile db
-
-bsdFile :: String -> String
-bsdFile db = "/var/db/sqlite/" <> db <> ".db"
-
-bsd :: String -> String -> String -> String
-bsd install installed bin = String.joinWith "\n"
-  [ "set -e"
-  , "export PATH=" <> bin <> ":$PATH"
-  , installed <> " || " <> install <> " >/dev/null"
-  , "f=/var/db/sqlite/$SBX_DB.db"
-  , "[ -f \"$f\" ] || sqlite3 \"$f\" 'PRAGMA journal_mode=WAL;' >/dev/null"
-  ]
+-- | Where the SQLite file is: inside sqld's database directory, or a plain
+-- | file for the in-process engines.
+file :: String -> String -> String
+file v db = if serverless v then dataDir <> "/" <> db <> ".db" else dataDir <> "/" <> db <> "/dbs/default/data"

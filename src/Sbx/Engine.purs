@@ -15,6 +15,7 @@ module Sbx.Engine
   , pullImage
   , runContainer
   , toolImage
+  , serverImage
   ) where
 
 import Prelude
@@ -146,13 +147,26 @@ runContainer p st c = do
     env = Array.concat (Object.toArrayWithKey (\k v -> [ "-e", k <> "=" <> v ]) (p.env c))
     args =
       [ "run", "-d", "--name", containerName p, "--restart", "unless-stopped"
+      , "-v", mountPoint p st.branch <> ":" <> p.dataDir Linux
+      ]
       -- On every interface of the VM (gvproxy cannot reach its loopback);
       -- the engine binds it to 127.0.0.1 on the host.
-      , "-p", show st.port <> ":" <> show p.guestPort
-      , "-v", mountPoint p st.branch <> ":" <> p.dataDir Linux
-      ] <> env <> [ p.image st.version ] <> fromMaybe [] p.command
+      <> (if p.serves st.version then [ "-p", show st.port <> ":" <> show p.guestPort ] else [])
+      <> env <> [ serverImage p st.version ] <> fromMaybe [] (p.command st.version)
   r <- Docker.docker args
   unless (r.exitCode == 0) $ throwError (error ("docker run: " <> String.trim r.stderr))
+
+-- | The helper image's full name: tagged with its Dockerfile's hash, so a
+-- | changed Dockerfile builds a new image instead of reusing the old one.
+toolsTag :: { image :: String, dockerfile :: String } -> String
+toolsTag t = t.image <> ":" <> String.take 12 (Native.sha256 t.dockerfile)
+
+-- | The image a version runs as the container: the helper image when the
+-- | profile names it (server-less engines), else the version's own.
+serverImage :: Profile -> String -> String
+serverImage p version = case p.tools of
+  Just t | p.image version == t.image -> toolsTag t
+  _ -> p.image version
 
 -- | The profile's helper image for the CLIs, built in the engine the first
 -- | time from its inline Dockerfile (a context directory under the tool's
@@ -161,14 +175,15 @@ toolImage :: Profile -> Aff (Maybe String)
 toolImage p = case p.tools of
   Nothing -> pure Nothing
   Just t -> do
-    have <- Docker.docker [ "image", "inspect", t.image ] <#> (_.exitCode >>> eq 0)
+    let image = toolsTag t
+    have <- Docker.docker [ "image", "inspect", image ] <#> (_.exitCode >>> eq 0)
     unless have do
-      say ("Building the " <> t.image <> " image (sqlite3 and friends) in the engine ...")
+      say ("Building the " <> image <> " image (the CLIs) in the engine ...")
       dir <- liftEffect do
         d <- Native.configDir p.tool <#> \c -> Native.pathJoin c "tools"
         Native.mkdirp d
         Native.writeText (Native.pathJoin d "Dockerfile") t.dockerfile
         pure d
-      code <- Docker.dockerAttached [ "build", "-t", t.image, dir ]
-      unless (code == 0) $ throwError (error ("docker build " <> t.image <> " failed"))
-    pure (Just t.image)
+      code <- Docker.dockerAttached [ "build", "-t", image, dir ]
+      unless (code == 0) $ throwError (error ("docker build " <> image <> " failed"))
+    pure (Just image)

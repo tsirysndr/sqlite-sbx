@@ -79,3 +79,6 @@ foreign import reapOrphanGvproxies :: Int -> Effect (Array Int)
 foreign import colorOutput :: Effect Boolean
 -- | Wrap text in an SGR code (`"36"` is teal).
 foreign import ansi :: String -> String -> String
+
+-- | Hex SHA-256 of a string.
+foreign import sha256 :: String -> String

@@ -155,8 +155,8 @@ waitFor what seconds check = go 0
     | n >= seconds = fail (what <> " did not come up within " <> show seconds <> "s")
     | otherwise = check >>= \ok -> unless ok (delay (Milliseconds 1000.0) *> go (n + 1))
 
-waitReady :: Profile -> Os -> Creds -> Runtime -> Aff Unit
-waitReady p os c rt = do
+waitReady :: Profile -> Os -> State -> Runtime -> Aff Unit
+waitReady p os st rt = do
   say ("Waiting for " <> p.product <> " ...")
   waitFor p.product 180 do
     alive <- case rt of
@@ -165,7 +165,7 @@ waitReady p os c rt = do
     unless alive $ fail case rt of
       Vm _ -> "the VM exited while " <> p.product <> " was starting; `" <> p.tool <> " log` and `" <> p.tool <> " log --boot` say why"
       Container _ -> "the container exited while " <> p.product <> " was starting; `" <> p.tool <> " log` says why"
-    probeIn rt (p.ready os c)
+    probeIn rt (p.ready os st.version (creds st))
 
 -- | The profile's setup script, if any: idempotent, run as root through the
 -- | agent on every start (the first run installs packages).
@@ -261,8 +261,8 @@ ensurePort p port = do
 
 -- | Everything between a booted VM and a usable server. With `stream`, the
 -- | provisioning output shows on the terminal; `start -d` turns that off.
-bringUp :: Profile -> Boolean -> Os -> Creds -> Sandbox -> Aff Unit
-bringUp p stream os c box = provision p stream os c box *> waitReady p os c (Vm box)
+bringUp :: Profile -> Boolean -> Os -> State -> Sandbox -> Aff Unit
+bringUp p stream os st box = provision p stream os (creds st) box *> waitReady p os st (Vm box)
 
 -- | Run an action while the VM console streams to the terminal (`start -d`
 -- | skips it): everything the console holds for a VM just created, only what
@@ -283,8 +283,8 @@ withContainerLogs true p act = do
 
 ready :: Profile -> State -> Aff Unit
 ready p st = do
-  say (p.product <> " is ready on 127.0.0.1:" <> show st.port <> " (branch " <> st.branch <> ")")
-  say ("  " <> p.url (creds st) st.port)
+  say (p.product <> " is ready" <> (if p.serves st.version then " on 127.0.0.1:" <> show st.port else "") <> " (branch " <> st.branch <> ")")
+  say ("  " <> p.url st.version (creds st) st.port)
 
 rootfsVolume :: Profile -> String
 rootfsVolume p = p.tool <> "-rootfs"
@@ -296,6 +296,7 @@ start p o = do
   st <- liftEffect (State.load p.tool)
   for_ st \s -> for_ o.os \os -> when (osName os /= s.os) $ fail ("this sandbox runs " <> s.os <> ", not " <> osName os <> "; `" <> p.tool <> " destroy` to start over")
   let os = fromMaybe Linux ((st >>= _.os >>> parseOs) <|> o.os)
+  when (p.linuxOnly && os /= Linux) $ fail (p.tool <> " runs on Linux only, as a container in the shared Docker engine VM")
   if os == Linux then startLinux p o st else startVm p o st
 
 -- | Linux: the server is a container in the shared engine VM, recreated
@@ -344,10 +345,13 @@ startLinux p o previous = do
     Engine.ensureAttached p vol branchName
     ensurePort p port
     liftEffect (State.save p.tool st)
-    Engine.pullImage p st (not o.detach)
+    case p.tools of
+      -- The helper image is the server image: build it rather than pull it.
+      Just t | p.image version == t.image -> void (Engine.toolImage p)
+      _ -> Engine.pullImage p st (not o.detach)
     Engine.runContainer p st c
-    withContainerLogs (not o.detach) p (waitReady p Linux c (Container (Engine.containerName p)))
-    waitHostPort port
+    withContainerLogs (not o.detach) p (waitReady p Linux st (Container (Engine.containerName p)))
+    when (p.serves version) $ waitHostPort port
     ready p st
     pure 0
 
@@ -395,7 +399,7 @@ startVm p o saved = do
               ensurePort p s'.port
               withConsole (not o.detach) false box do
                 void (B.start box)
-                bringUp p (not o.detach) os (creds s') box
+                bringUp p (not o.detach) os s' box
               ready p s'
               pure 0
     Just m, Nothing -> fail ("a machine named '" <> p.tool <> "' exists (" <> m.id <> ") but this tool did not record it; remove it with `bsdkrun rm -f " <> m.id <> "` or `" <> p.tool <> " destroy`")
@@ -425,7 +429,7 @@ startVm p o saved = do
       base = case os of
         Linux -> Options.linux (p.image version) # Options.withEnv (p.env c)
           # (if p.rootfsVolume then Options.withVolume (rootfsVolume p) else identity)
-          # maybe identity Options.withCommand p.command
+          # maybe identity Options.withCommand (p.command version)
         FreeBSD -> Options.freebsd # bsdVersion # rootDisk FreeBSD
         NetBSD -> Options.netbsd # bsdVersion # rootDisk NetBSD
       opts = base
@@ -440,7 +444,7 @@ startVm p o saved = do
     box <- B.create opts
     liftEffect (State.save p.tool st)
     say ("VM " <> B.sandboxId box <> " is up")
-    withConsole (not o'.detach) true box (bringUp p (not o'.detach) os c box)
+    withConsole (not o'.detach) true box (bringUp p (not o'.detach) os st box)
     ready p st
     pure 0
 
@@ -485,7 +489,7 @@ status p = do
       row "branch" (cur <> if Array.length names > 1 then "  (" <> String.joinWith ", " names <> ")" else "")
       for_ vol \v -> row "volume" (v.name <> " " <> maybe "" (\s -> s <> " used") (toMaybe v.size) <> (if Array.null v.attachedTo then " (not attached)" else ""))
       for_ st \s -> when p.hasCredentials $ row "database" (s.db <> " as " <> s.user)
-      for_ st \s -> row "url" (p.url (creds s) s.port)
+      for_ st \s -> row "url" (p.url s.version (creds s) s.port)
   case st, mm of
     Nothing, Nothing -> say ("no sandbox yet — run `" <> p.tool <> " start`") $> 0
     Just s, Nothing | parseOs s.os == Just Linux -> do
@@ -498,10 +502,10 @@ status p = do
       row "container" case c of
         Nothing -> "not created (`" <> p.tool <> " start` creates it)"
         Just k -> k.id <> ", " <> describe p s <> ", " <> k.status
-      row "port" (portOf s)
+      when (p.serves s.version) $ row "port" (portOf s)
       rest
-      when up do
-        ok <- probeIn (Container (Engine.containerName p)) (p.ready Linux (creds s))
+      when (up && p.serves s.version) do
+        ok <- probeIn (Container (Engine.containerName p)) (p.ready Linux s.version (creds s))
         row "server" (if ok then "accepting connections" else "not accepting connections yet")
       pure 0
     _, _ -> do
@@ -521,7 +525,7 @@ status p = do
         Just s, Just m | m.running -> do
           os <- stateOs s
           box <- B.get m.id
-          ok <- probe (p.ready os (creds s)) box
+          ok <- probe (p.ready os s.version (creds s)) box
           row "server" (if ok then "accepting connections" else "not accepting connections yet")
         _, _ -> pure unit
       pure 0
@@ -637,8 +641,8 @@ checkout p o = do
     when running do
       say ("Starting " <> p.tool <> " on branch " <> o.name <> " ...")
       Engine.runContainer p st' (creds st)
-      waitReady p Linux (creds st) (Container (Engine.containerName p))
-      waitHostPort st.port
+      waitReady p Linux st' (Container (Engine.containerName p))
+      when (p.serves st.version) $ waitHostPort st.port
     say ("Switched to branch '" <> o.name <> "'")
     pure 0
   else do
@@ -658,14 +662,14 @@ checkout p o = do
         when m.running do
           say ("Starting " <> p.tool <> " on branch " <> o.name <> " ...")
           _ <- B.start box
-          bringUp p false os (creds st) box
+          bringUp p false os st box
         say ("Switched to branch '" <> o.name <> "'")
     pure 0
 
 url :: Profile -> Aff Int
 url p = do
   st <- requireState p
-  say (p.url (creds st) st.port)
+  say (p.url st.version (creds st) st.port)
   pure 0
 
 client :: Profile -> Aff Int
@@ -673,11 +677,11 @@ client p = do
   { runtime, state: st } <- requireRunning p
   os <- stateOs st
   case p.client of
-    Guest argv -> interactive p st runtime (argv os (creds st))
+    Guest argv -> interactive p st runtime (argv os st.version (creds st))
     Host argv -> do
       node <- liftEffect Native.nodePath
       root <- liftEffect Native.toolRoot
-      Native.spawnInherit node (map (Native.pathJoin root) (Array.take 1 (argv st.port (creds st))) <> Array.drop 1 (argv st.port (creds st))) (Object.singleton "DATABASE_URL" (p.url (creds st) st.port))
+      Native.spawnInherit node (map (Native.pathJoin root) (Array.take 1 (argv st.port (creds st))) <> Array.drop 1 (argv st.port (creds st))) (Object.singleton "DATABASE_URL" (p.url st.version (creds st) st.port))
 
 -- | `uvx` or `pipx run`: how a Python CLI is run on the host without
 -- | installing it by hand.
@@ -695,7 +699,7 @@ fancy p = do
   { runtime, state: st } <- requireRunning p
   os <- stateOs st
   case p.fancy.cmd of
-    GuestTool argv -> interactive p st runtime (argv os (creds st))
+    GuestTool argv -> interactive p st runtime (argv os st.version (creds st))
     HostTool argv -> do
       runner <- pythonRunner
       Native.spawnInherit runner.cmd (runner.args <> argv (creds st) st.port) Object.empty
@@ -725,7 +729,7 @@ drizzleConfig p st = liftEffect do
     [ "// Written by " <> p.tool <> " for `" <> p.tool <> " studio` and `" <> p.tool <> " drizzle`."
     , "export default {"
     , "  dialect: \"" <> p.dialect <> "\","
-    , "  dbCredentials: { url: \"" <> p.url (creds st) st.port <> "\" },"
+    , "  dbCredentials: { url: \"" <> p.url st.version (creds st) st.port <> "\" },"
     , "};"
     , ""
     ]
@@ -735,17 +739,17 @@ studio :: Profile -> { port :: Int, host :: String } -> Aff Int
 studio p o = do
   { state: st } <- requireRunning p
   os <- stateOs st
-  unless (p.studioSupported os) $ fail ("Drizzle Studio needs a network-reachable server, which " <> p.product <> " on " <> st.os <> " does not provide")
+  unless (p.studioSupported os st.version) $ fail ("Drizzle Studio needs a network-reachable server, which " <> p.product <> " " <> st.version <> " on " <> st.os <> " does not provide")
   kit <- drizzleKit
   cfg <- drizzleConfig p st
-  say ("Drizzle Studio on " <> p.url (creds st) st.port <> " — open https://local.drizzle.studio")
+  say ("Drizzle Studio on " <> p.url st.version (creds st) st.port <> " — open https://local.drizzle.studio")
   Native.spawnInherit kit.cmd (kit.args <> [ "studio", "--config", cfg, "--port", show o.port, "--host", o.host ]) Object.empty
 
 drizzle :: Profile -> Array String -> Aff Int
 drizzle p args = do
   st <- requireState p
   os <- stateOs st
-  unless (p.studioSupported os) $ fail ("drizzle-kit needs a network-reachable server, which " <> p.product <> " on " <> st.os <> " does not provide")
+  unless (p.studioSupported os st.version) $ fail ("drizzle-kit needs a network-reachable server, which " <> p.product <> " " <> st.version <> " on " <> st.os <> " does not provide")
   kit <- drizzleKit
   dir <- liftEffect Native.cwd
   own <- liftEffect $ Array.foldM (\acc f -> (acc || _) <$> Native.fileExists (Native.pathJoin dir f)) false
@@ -753,7 +757,7 @@ drizzle p args = do
   args' <-
     if own || Array.elem "--config" args then pure args
     else drizzleConfig p st <#> \cfg -> args <> [ "--config", cfg ]
-  Native.spawnInherit kit.cmd (kit.args <> args') (Object.singleton "DATABASE_URL" (p.url (creds st) st.port))
+  Native.spawnInherit kit.cmd (kit.args <> args') (Object.singleton "DATABASE_URL" (p.url st.version (creds st) st.port))
 
 -- Migrations (pgroll) --------------------------------------------------------
 

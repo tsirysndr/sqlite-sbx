@@ -16,7 +16,7 @@ import Data.Foldable (fold)
 import Data.Maybe (Maybe(..), maybe, optional)
 import Effect (Effect)
 import Options.Applicative (Parser, ReadM, argument, command, commandGroup, customExecParser, eitherReader, footer, forwardOptions, fullDesc, header, help, helper, hidden, info, infoOption, int, long, many, metavar, option, prefs, progDesc, short, showHelpOnEmpty, strArgument, strOption, subparser, switch, value)
-import Sbx.Profile (Os, Profile, parseOs)
+import Sbx.Profile (Os(..), Profile, parseOs)
 
 type StartOpts =
   { os :: Maybe Os
@@ -67,15 +67,20 @@ data MigrateCmd
   | MigratePull { dir :: Maybe String }
   | MigrateBaseline { version :: String, dir :: Maybe String }
 
-osReader :: ReadM Os
-osReader = eitherReader \s -> maybe (Left ("expected linux, freebsd or netbsd, got '" <> s <> "'")) Right (parseOs s)
+osReader :: Profile -> ReadM Os
+osReader p = eitherReader \s -> case parseOs s of
+  Just os | p.linuxOnly && os /= Linux -> Left (p.tool <> " runs on Linux only (a container in the shared Docker engine VM)")
+  Just os -> Right os
+  Nothing -> Left ((if p.linuxOnly then "expected linux, got '" else "expected linux, freebsd or netbsd, got '") <> s <> "'")
 
 startP :: Profile -> Parser Command
 startP p = ado
-  os <- optional $ argument osReader $ fold
-    [ metavar "linux|freebsd|netbsd", help "Guest OS (default: linux, a container in the shared Docker engine VM; the BSDs get a VM each)" ]
+  os <- optional $ argument (osReader p) $ fold
+    [ metavar (if p.linuxOnly then "linux" else "linux|freebsd|netbsd")
+    , help (if p.linuxOnly then "Guest OS: linux only, a container in the shared Docker engine VM" else "Guest OS (default: linux, a container in the shared Docker engine VM; the BSDs get a VM each)")
+    ]
   version <- optional $ strArgument $ fold
-    [ metavar "VERSION", help ("Linux: image tag, e.g. " <> p.defaultTag <> " or " <> p.defaultTag <> "-alpine, or a full image reference (default: " <> p.defaultTag <> "). FreeBSD/NetBSD: OS release, e.g. 15.1 or 10.1 (default: latest)") ]
+    [ metavar "VERSION", help ("Linux: image tag, e.g. " <> p.defaultTag <> " or " <> p.defaultTag <> "-alpine, or a full image reference (default: " <> p.defaultTag <> ")" <> p.versionNote <> (if p.linuxOnly then "" else ". FreeBSD/NetBSD: OS release, e.g. 15.1 or 10.1 (default: latest)")) ]
   port <- optional $ option int $ fold
     [ long "port", short 'p', metavar "PORT", help ("Host port forwarded to " <> p.product <> " (default: " <> show p.guestPort <> ")") ]
   user <- credential "user" ("Superuser name (default: " <> p.defaults.user <> ")")
@@ -210,12 +215,14 @@ commands p = case p.migrations of
     )
     <|> subparser
       ( fold
+          ( map (\alias -> command alias $ info (pure Client) $ progDesc ("Alias of " <> p.clientName)) p.clientAliases <>
           [ command "shell" $ info (pure Shell) $ progDesc "Alias of ssh"
           , command "logs" $ info (helper <*> logsP) $ progDesc "Alias of log"
           , command "switch" $ info (helper <*> checkoutP) $ progDesc "Alias of checkout"
           , commandGroup "Aliases:"
           , hidden
           ]
+          )
       )
   migrationCommands m = subparser
     ( fold

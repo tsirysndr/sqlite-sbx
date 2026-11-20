@@ -30,7 +30,7 @@ type Creds = { user :: String, password :: String, db :: String }
 -- | How the interactive client runs: with a PTY inside the guest, or as a
 -- | host program (`node` script under the package root, given the host port).
 data ClientCmd
-  = Guest (Os -> Creds -> Array String)
+  = Guest (Os -> String -> Creds -> Array String)
   | Host (Int -> Creds -> Array String)
 
 -- | The friendlier CLI (pgcli, mycli, litecli): run on the host through
@@ -38,7 +38,7 @@ data ClientCmd
 -- | with a PTY inside the guest.
 data FancyCmd
   = HostTool (Creds -> Int -> Array String)
-  | GuestTool (Os -> Creds -> Array String)
+  | GuestTool (Os -> String -> Creds -> Array String)
 
 -- | A schema-migration tool that runs on the host against the sandbox
 -- | (pgroll for PostgreSQL): how to install it and how to point it at the
@@ -58,8 +58,11 @@ type Profile =
   { tool :: String -- ^ the command name; also the machine and volume name
   , product :: String -- ^ "PostgreSQL"
   , guestPort :: Int -- ^ the port the server listens on inside the guest
+  , serves :: String -> Boolean -- ^ whether that version runs a server on guestPort (published and waited for)
   , defaultTag :: String -- ^ Linux image tag when none is given
   , image :: String -> String -- ^ Linux image for a tag (or a full reference)
+  , versionNote :: String -- ^ appended to the VERSION help: other values the tag may take
+  , linuxOnly :: Boolean -- ^ no BSD guests: only a container in the engine
   , hasCredentials :: Boolean -- ^ whether --user/--password mean anything
   , defaults :: Creds
   , dataDir :: Os -> String -- ^ where the ZFS branch is mounted (the data directory lives in it)
@@ -67,14 +70,15 @@ type Profile =
   , rootfsVolume :: Boolean -- ^ keep the Linux rootfs on a named volume, so what provisioning installs survives restarts
   , tools :: Maybe { image :: String, dockerfile :: String } -- ^ Linux: an image with the CLIs when the server image has none, built in the engine once; run with the branch mounted
   , env :: Creds -> Object String -- ^ the Linux image's environment
-  , command :: Maybe (Array String) -- ^ override the Linux image's command
+  , command :: String -> Maybe (Array String) -- ^ override the Linux image's command, by version
   , provision :: Os -> Maybe String -- ^ setup script run as root on every start; reads SBX_USER, SBX_PASSWORD, SBX_DB
-  , ready :: Os -> Creds -> Array String -- ^ exits 0 once the server accepts TCP connections
+  , ready :: Os -> String -> Creds -> Array String -- ^ exits 0 once the server accepts TCP connections (by OS and version)
   , client :: ClientCmd -- ^ the interactive client
   , clientName :: String -- ^ the subcommand that opens it ("psql")
+  , clientAliases :: Array String -- ^ hidden aliases of that subcommand
   , fancy :: { name :: String, cmd :: FancyCmd } -- ^ pgcli / mycli / litecli
-  , url :: Creds -> Int -> String -- ^ connection URL for a host port
-  , studioSupported :: Os -> Boolean -- ^ whether drizzle-kit can reach it on that guest
+  , url :: String -> Creds -> Int -> String -- ^ connection URL for a host port, by version
+  , studioSupported :: Os -> String -> Boolean -- ^ whether drizzle-kit can reach it on that guest and version
   , migrations :: Maybe Migrations -- ^ host-side migration tool, if any
   , dialect :: String -- ^ drizzle-kit dialect
   , driver :: String -- ^ the npm driver drizzle-kit needs for it

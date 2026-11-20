@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { spawn, execFile } from "node:child_process";
@@ -92,3 +93,5 @@ export const reapOrphanGvproxies = port => () => {
 // Colour only on a terminal, and not when NO_COLOR asks for plain output.
 export const colorOutput = () => Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
 export const ansi = code => text => `\x1b[${code}m${text}\x1b[0m`;
+
+export const sha256 = text => createHash("sha256").update(text).digest("hex");

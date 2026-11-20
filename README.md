@@ -26,9 +26,7 @@ on the host and talk to sqld over a forwarded port; the file-based tools run in
 the guest.
 
 Written in PureScript on the [bsdkrun PureScript
-SDK](https://github.com/tsirysndr/bsdkrun-purescript). Siblings:
-[postgres-sbx](../postgres-sbx) and [mariadb-sbx](../mariadb-sbx) share the
-same code and commands.
+SDK](https://github.com/tsirysndr/bsdkrun-purescript).
 
 ## Requirements
 

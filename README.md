@@ -19,11 +19,10 @@ sqlite-sbx checkout main           # back to the untouched data
 sqlite-sbx branch -d feature       # done with it
 ```
 
-One parent sandbox per tool, with parallel branch instances: a VM named `sqlite-sbx`, a ZFS volume named `sqlite-sbx`
-(the data), a plain volume `sqlite-sbx-rootfs` (what provisioning installs),
-and a small state file under `~/.config/sqlite-sbx`. Studio and drizzle-kit run
-on the host and talk to sqld over a forwarded port; the file-based tools run in
-the guest.
+The sandbox uses one ZFS volume named `sqlite-sbx` and records its settings
+under `~/.config/sqlite-sbx`. Its parent and parallel branch instances run as
+containers in the shared Docker VM. Studio and drizzle-kit reach libSQL over
+forwarded ports; file-based clients run inside the containers.
 
 Written in PureScript on the [bsdkrun PureScript
 SDK](https://github.com/tsirysndr/bsdkrun-purescript).

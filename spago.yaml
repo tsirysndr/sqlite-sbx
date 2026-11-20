@@ -30,9 +30,7 @@ workspace:
     registry: 77.0.0
   extraPackages:
     bsdkrun:
-      # The bsdkrun PureScript SDK. Point this at a sibling checkout while
-      # developing, or at the repository once the ZFS/shell additions are
-      # pushed:
-      #   git: https://github.com/tsirysndr/bsdkrun-purescript.git
-      #   ref: <tag or commit>
-      path: ../bsdkrun-purescript
+      # The bsdkrun PureScript SDK, pinned to a commit. For local SDK work,
+      # swap in:   path: ../bsdkrun-purescript
+      git: https://github.com/tsirysndr/bsdkrun-purescript.git
+      ref: c3db745a821bdd04a0d3f04bf6667da6c38c9ade

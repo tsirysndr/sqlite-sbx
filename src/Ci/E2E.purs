@@ -72,8 +72,11 @@ runtime :: Context -> Array String -> Aff String
 runtime c args = _.stdout <$> command c defaultOptions c.runtime args
 
 query :: Context -> String -> Aff String
-query c sql = do
-  uri <- cliWith c (defaultOptions { secret = true }) [ "url" ]
+query c = queryAt c []
+
+queryAt :: Context -> Array String -> String -> Aff String
+queryAt c selected sql = do
+  uri <- cliWith c (defaultOptions { secret = true }) (selected <> [ "url" ])
   rows <- Database.query { url: S.trim uri.stdout, sql }
   pure (S.joinWith "\n" (map (S.joinWith ",") rows))
 
@@ -116,43 +119,72 @@ body c = do
   binary <- liftEffect (N.resolve "dist/sqlite-sbx")
   result <- command c defaultOptions binary [ "--version" ]
   assertEqual ("sqlite-sbx " <> c.version) (S.trim result.stdout)
+  guest <- C.fallback "SBX_E2E_OS" "linux"
+  C.demand "Expected linux, freebsd or netbsd" (A.elem guest ["linux", "freebsd", "netbsd"])
   port <- freePort
   liftEffect (Ref.write true c.started)
   void $ cliWith c (defaultOptions { timeout = 600000 })
-    ([ "start", "linux", "latest", "--port", show port, "-d" ] <> [])
+    ([ "start", guest ] <> (if guest == "linux" then ["latest"] else ["--mem", "2048"]) <> [ "--port", show port, "-d" ] <> [])
   query c "SELECT 42;" >>= assertEqual "42"
   pass c "host libSQL client reaches the server through the forwarded HTTP port"
   void $ query c "CREATE TABLE e2e_values (n INTEGER);"
   void $ query c "INSERT INTO e2e_values VALUES (42);"
-  unless wasRunning do
+  when (guest == "linux" && not wasRunning) do
     Install.verifyDriver c.runtime
     void $ runtime c [ "docker", "stop" ]
     void $ cli c [ "start", "-d" ]
     Install.verifyDriver c.runtime
     query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
     pass c "normal startup creates an overlay/ext4 engine and preserves it across VM restart"
-  void $ cli c [ "checkout", "-b", "feature" ]
-  void $ query c "UPDATE e2e_values SET n=7;"
+  void $ cli c [ "branch", "feature" ]
+  queryAt c ["--branch", "feature"] "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  void $ queryAt c ["--branch", "feature"] "UPDATE e2e_values SET n=7;"
+  queryAt c ["--branch", "feature"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+  query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  void $ cli c [ "branch", "nested", "--from", "feature" ]
+  queryAt c ["--branch", "nested"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+  void $ cli c [ "checkout", "feature" ]
   query c "SELECT n FROM e2e_values;" >>= assertEqual "7"
   void $ cli c [ "checkout", "main" ]
   query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  void $ cli c [ "stop" ]
+  queryAt c ["--branch", "feature"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+  void $ cli c [ "start", "-d" ]
+  query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  void $ cli c [ "--branch", "feature", "stop" ]
+  queryAt c ["--branch", "nested"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+  when (guest /= "linux") do
+    void $ runtime c ["stop", c.name]
+    void $ cli c ["start", "-d"]
+    queryAt c ["--branch", "nested"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+    stoppedFork <- cli c ["--branch", "feature", "status"]
+    C.demand "A stopped fork restarted with the BSD VM" (S.contains (S.Pattern "STOPPED") stoppedFork)
+  void $ cli c [ "--branch", "feature", "start", "-d" ]
+  queryAt c ["--branch", "feature"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
+  void $ cli c [ "branch", "-d", "nested" ]
+  queryAt c ["--branch", "feature"] "SELECT n FROM e2e_values;" >>= assertEqual "7"
   void $ cli c [ "branch", "-d", "feature" ]
-  pass c "ZFS branch writes are isolated and main retains its data"
+  query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  pass c "parallel containers, nested forks, focus changes, independent stops and ZFS isolation"
+
   void $ cli c [ "stop" ]
   stopped <- cli c [ "status" ]
   C.demand "Sandbox did not stop" (S.contains (S.Pattern "STOPPED") stopped)
-  collisionPort <- N.reservePort
-  liftEffect (Ref.write (Just collisionPort.handle) c.occupied)
-  collision <- cliWith c (defaultOptions { allowFailure = true }) [ "start", "--port", show collisionPort.port, "-d" ]
-  C.demand "Occupied port was accepted" (collision.code /= 0)
-  N.closePort collisionPort.handle
-  liftEffect (Ref.write Nothing c.occupied)
-  nextPort <- freePort
-  void $ cli c [ "start", "--port", show nextPort, "-d" ]
+  if guest == "linux" then do
+    collisionPort <- N.reservePort
+    liftEffect (Ref.write (Just collisionPort.handle) c.occupied)
+    collision <- cliWith c (defaultOptions { allowFailure = true }) [ "start", "--port", show collisionPort.port, "-d" ]
+    C.demand "Occupied port was accepted" (collision.code /= 0)
+    N.closePort collisionPort.handle
+    liftEffect (Ref.write Nothing c.occupied)
+    nextPort <- freePort
+    void $ cli c [ "start", "--port", show nextPort, "-d" ]
+  else void $ cli c ["start", "-d"]
   query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
-  void $ cli c [ "stop" ]
-  void $ cli c [ "start", "-d" ]
-  query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
+  when (guest == "linux") do
+    void $ cli c [ "stop" ]
+    void $ cli c [ "start", "-d" ]
+    query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
   pass c "occupied ports fail clearly; port changes and stop/start preserve data"
   liftEffect (Ref.write true c.succeeded)
 

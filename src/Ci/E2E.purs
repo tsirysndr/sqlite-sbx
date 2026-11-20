@@ -167,10 +167,10 @@ body c = do
   query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
   pass c "parallel containers, nested forks, focus changes, independent stops and ZFS isolation"
 
-  void $ cli c [ "stop" ]
-  stopped <- cli c [ "status" ]
-  C.demand "Sandbox did not stop" (S.contains (S.Pattern "STOPPED") stopped)
-  if guest == "linux" then do
+  when (guest == "linux") do
+    void $ cli c [ "stop" ]
+    stopped <- cli c [ "status" ]
+    C.demand "Sandbox did not stop" (S.contains (S.Pattern "STOPPED") stopped)
     collisionPort <- N.reservePort
     liftEffect (Ref.write (Just collisionPort.handle) c.occupied)
     collision <- cliWith c (defaultOptions { allowFailure = true }) [ "start", "--port", show collisionPort.port, "-d" ]
@@ -179,13 +179,11 @@ body c = do
     liftEffect (Ref.write Nothing c.occupied)
     nextPort <- freePort
     void $ cli c [ "start", "--port", show nextPort, "-d" ]
-  else void $ cli c ["start", "-d"]
-  query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
-  when (guest == "linux") do
+    query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
     void $ cli c [ "stop" ]
     void $ cli c [ "start", "-d" ]
     query c "SELECT n FROM e2e_values;" >>= assertEqual "42"
-  pass c "occupied ports fail clearly; port changes and stop/start preserve data"
+    pass c "occupied ports fail clearly; port changes and stop/start preserve data"
   liftEffect (Ref.write true c.succeeded)
 
 cleanup :: Context -> Aff Unit

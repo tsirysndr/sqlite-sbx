@@ -169,7 +169,7 @@ dispatch base p cmd = case cmd of
         for_ o.mem \_ -> fail "Resize the parent BSD VM after removing its parallel branches"
         if m.running then BSD.start p st $> 0 else do
           result <- base p cmd
-          for_ list \e -> when e.running (state (p {tool = e.tool}) >>= BSD.start (p {tool = e.tool}))
+          for_ list \e -> when e.running (void (startInstance base (p {tool = e.tool}) emptyStart))
           pure result
   Stop -> do
     list <- entries p

@@ -43,7 +43,7 @@ script p st action =
   in "set -eu\nexport PATH=/usr/local/bin:/usr/local/sbin:/usr/local/libexec:/usr/pkg/bin:/usr/pkg/sbin:/usr/pkg/libexec:$PATH\n" <> case p.product of
     "PostgreSQL" -> case action of
       "status" -> pgStatus
-      "stop" -> pgStatus <> " >/dev/null 2>&1 && " <> pg "-m fast -w stop" <> " || true"
+      "stop" -> "if (" <> pgStatus <> ") >/dev/null 2>&1; then " <> pg "-m fast -w stop" <> "; fi"
       _ -> "if ! (" <> pgStatus <> "); then if [ -f " <> q (pgData <> "/postmaster.pid") <> " ] && [ \"$(sed -n '2p' " <> q (pgData <> "/postmaster.pid") <> ")\" != " <> q pgData <> " ]; then rm -f " <> q (pgData <> "/postmaster.pid") <> "; fi; " <> pg ("-l " <> q (dir <> "/sbx-server.log") <> " -o " <> q ("-p " <> show (port p st) <> " -h 0.0.0.0 -k " <> dir) <> " -w start") <> "; fi"
     "MariaDB" -> case action of
       "status" -> if I.isInstance p.tool then mysqlStatus else (if st.os == "netbsd" then "if [ -x /etc/rc.d/mariadb ]; then /etc/rc.d/mariadb onestatus; else /etc/rc.d/mysqld onestatus; fi" else "service mysql-server onestatus")

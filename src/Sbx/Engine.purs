@@ -37,6 +37,7 @@ import Effect.Console (log)
 import Effect.Exception (error)
 import Foreign.Object as Object
 import Sbx.Native as Native
+import Sbx.Identity as Identity
 import Sbx.Profile (Creds, Os(..), Profile)
 import Sbx.State (State)
 
@@ -114,7 +115,7 @@ ensureAttached p vol branch
       let mounted = mountedInEngine vol
       unless (Array.any (\m -> m.branch == branch && m.mountpoint == mountPoint p branch) mounted) $
         void (Zfs.attachAt (target p branch) Docker.machineName (Just (mountPoint p branch)))
-      for_ (Array.filter (_.branch >>> (_ /= branch)) mounted) \m -> void (Zfs.detach (target p m.branch) Docker.machineName)
+      for_ (Array.filter (\m -> m.branch /= branch && String.take (String.length ("/mnt/" <> p.tool <> "-")) m.mountpoint == "/mnt/" <> p.tool <> "-") mounted) \m -> void (Zfs.detach (target p m.branch) Docker.machineName)
   | otherwise = do
       st <- Docker.status
       -- Nothing to attach to until the engine VM exists.
@@ -127,11 +128,11 @@ ensureAttached p vol branch
       ensureEngine
 
 target :: Profile -> String -> String
-target p b = Zfs.target p.tool (Just b)
+target p b = Zfs.target (Identity.volumeName p.tool) (Just b)
 
 -- | Let go of the whole volume (every branch) in the engine.
 detachVolume :: Profile -> ZfsVolumeInfo -> Aff Unit
-detachVolume p vol = when (heldByEngine vol) $ void (Zfs.detach (Zfs.target p.tool Nothing) Docker.machineName)
+detachVolume p vol = when (heldByEngine vol) $ void (Zfs.detach (Zfs.target (Identity.volumeName p.tool) Nothing) Docker.machineName)
 
 -- | The tool's container, running or not; `Nothing` while the engine is
 -- | down, since nothing can be asked.

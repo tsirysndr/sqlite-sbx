@@ -30,13 +30,19 @@ import Effect.Exception (error, message)
 import Foreign.Object as Object
 import Sbx.Cli (BranchOpts, Command(..), MigrateCmd(..), StartOpts)
 import Sbx.Engine as Engine
+import Sbx.Identity as Identity
+import Sbx.Parallel as Parallel
 import Sbx.Native as Native
 import Sbx.Profile (ClientCmd(..), Creds, FancyCmd(..), Migrations, Os(..), Profile, osName, parseOs)
 import Sbx.State (State)
 import Sbx.State as State
 
 run :: Profile -> Command -> Aff Int
-run p = case _ of
+run = Parallel.run runBase
+
+runBase :: Profile -> Command -> Aff Int
+runBase p = case _ of
+  OnBranch _ _ -> fail "Internal branch dispatch error"
   Start o -> start p o
   Stop -> stop p
   Status -> status p
@@ -68,7 +74,7 @@ findMachine :: Profile -> Aff (Maybe SandboxInfo)
 findMachine p = B.list true <#> Array.find \m -> toMaybe m.name == Just p.tool
 
 findVolume :: Profile -> Aff (Maybe ZfsVolumeInfo)
-findVolume p = Zfs.list <#> Array.find (_.name >>> eq p.tool)
+findVolume p = Zfs.list <#> Array.find (_.name >>> eq (Identity.volumeName p.tool))
 
 requireVolume :: Profile -> Aff ZfsVolumeInfo
 requireVolume p = findVolume p >>= maybe (fail ("no data volume yet — run `" <> p.tool <> " start` first")) pure
@@ -128,7 +134,7 @@ currentBranch :: Profile -> Aff String
 currentBranch p = do
   vol <- findVolume p
   st <- liftEffect (State.load p.tool)
-  pure $ fromMaybe "main" ((vol >>= mountedBranch) <|> (st <#> _.branch))
+  pure $ fromMaybe "main" ((st <#> _.branch) <|> (vol >>= mountedBranch))
 
 branchNames :: ZfsVolumeInfo -> Array String
 branchNames vol = Array.nub ([ "main" ] <> map _.name vol.branches)
@@ -407,12 +413,12 @@ startVm p o saved = do
   where
   create previous o' = do
     let
-      os = fromMaybe Linux o'.os
-      version = fromMaybe (if os == Linux then p.defaultTag else "") o'.version
-      c = { user: fromMaybe p.defaults.user o'.user, password: fromMaybe p.defaults.password o'.password, db: fromMaybe p.defaults.db o'.db }
-      port = fromMaybe p.guestPort o'.port
-      cpus = fromMaybe 2 o'.cpus
-      mem = fromMaybe 1024 o'.mem
+      os = fromMaybe (fromMaybe Linux (previous >>= _.os >>> parseOs)) o'.os
+      version = fromMaybe (maybe (if os == Linux then p.defaultTag else "") _.version previous) o'.version
+      c = { user: fromMaybe (maybe p.defaults.user _.user previous) o'.user, password: fromMaybe (maybe p.defaults.password _.password previous) o'.password, db: fromMaybe (maybe p.defaults.db _.db previous) o'.db }
+      port = fromMaybe (maybe p.guestPort _.port previous) o'.port
+      cpus = fromMaybe (maybe 2 _.cpus previous) o'.cpus
+      mem = fromMaybe (maybe 1024 _.mem previous) o'.mem
       size = fromMaybe "10G" o'.size
       branchName = fromMaybe (maybe "main" _.branch previous) o'.branch
     vol <- findVolume p >>= case _ of
@@ -437,7 +443,7 @@ startVm p o saved = do
         # Options.withCpus cpus
         # Options.withMem mem
         # Options.withPorts [ show port <> ":" <> show p.guestPort ]
-        # Options.withZfs [ Zfs.target p.tool (Just branchName) <> ":" <> p.dataDir os ]
+        # Options.withZfs [ Zfs.target (Identity.volumeName p.tool) (Just branchName) <> ":" <> p.dataDir os ]
       st = { os: osName os, version, port, user: c.user, password: c.password, db: c.db, branch: branchName, cpus, mem }
     say ("Creating " <> describe p st <> " VM '" <> p.tool <> "' with branch " <> branchName <> " at " <> p.dataDir os <> " (" <> show cpus <> " vCPU, " <> show mem <> " MiB) ...")
     ensurePort p port
@@ -482,11 +488,11 @@ status p = do
     row k v = say ("  " <> String.take 10 (k <> "          ") <> v)
     portOf s = "127.0.0.1:" <> show s.port <> " -> " <> show p.guestPort
     paint code s = if tint then Native.ansi code s else s
-    upOrDown up = if up then paint "36" "RUNNING" else "STOPPED"
+    upOrDown up = if up then paint "38;2;0;255;195" "RUNNING" else "STOPPED"
     rest = do
       cur <- currentBranch p
       let names = maybe [ "main" ] branchNames vol
-      row "branch" (cur <> if Array.length names > 1 then "  (" <> String.joinWith ", " names <> ")" else "")
+      row "branch" (paint "38;2;0;255;195" cur <> if Array.length names > 1 then "  (" <> String.joinWith ", " names <> ")" else "")
       for_ vol \v -> row "volume" (v.name <> " " <> maybe "" (\s -> s <> " used") (toMaybe v.size) <> (if Array.null v.attachedTo then " (not attached)" else ""))
       for_ st \s -> when p.hasCredentials $ row "database" (s.db <> " as " <> s.user)
       for_ st \s -> row "url" (p.url s.version (creds s) s.port)
@@ -498,7 +504,7 @@ status p = do
       let up = maybe false (_.state >>> eq "running") c
       say p.tool
       row "status" (upOrDown up)
-      row "engine" (Docker.machineName <> " " <> (if engine.running then "RUNNING" else if isJust (toMaybe engine.machineId) then "STOPPED" else "not created"))
+      row "engine" (Docker.machineName <> " " <> (if engine.running then paint "38;2;0;255;195" "RUNNING" else if isJust (toMaybe engine.machineId) then "STOPPED" else "not created"))
       row "container" case c of
         Nothing -> "not created (`" <> p.tool <> " start` creates it)"
         Just k -> k.id <> ", " <> describe p s <> ", " <> k.status
@@ -589,7 +595,10 @@ branch' p o = case o.name, o.delete of
       origin b = maybe "" (\from -> "  (from " <> from <> ")") (toMaybe b.origin)
       known = map (\b -> b.name /\ origin b) vol.branches
       rows = if Array.any (fst' >>> eq "main") known then known else [ "main" /\ "  (initialised on first start)" ] <> known
-    for_ rows \(name /\ note) -> say ((if name == cur then "* " else "  ") <> name <> note)
+    color <- liftEffect Native.colorOutput
+    for_ rows \(name /\ note) -> do
+      let label = (if name == cur then "* " else "  ") <> name
+      say ((if color && name == cur then Native.ansi "38;2;0;255;195" label else label) <> note)
     pure 0
   Just name, true -> do
     vol <- requireVolume p
@@ -597,7 +606,7 @@ branch' p o = case o.name, o.delete of
     when (name == "main") $ fail "main cannot be deleted; `destroy` removes the whole volume"
     when (name == cur) $ fail ("'" <> name <> "' is the mounted branch; checkout another one first")
     unless (Array.elem name (branchNames vol)) $ fail ("no branch '" <> name <> "'")
-    Zfs.destroy [ Zfs.target p.tool (Just name) ] false
+    Zfs.destroy [ Zfs.target (Identity.volumeName p.tool) (Just name) ] false
     say ("Deleted branch '" <> name <> "'")
     pure 0
   Just name, false -> do
@@ -611,7 +620,7 @@ branch' p o = case o.name, o.delete of
       _ -> findMachine p <#> maybe false _.running
     unless holder $ say "(the VM holding the volume is not running: a short-lived FreeBSD helper does the fork)"
     say ("Forking " <> from <> " -> " <> name <> " ...")
-    _ <- Zfs.branch p.tool name (Just from)
+    _ <- Zfs.branch (Identity.volumeName p.tool) name (Just from)
     say ("Branch '" <> name <> "' created. Switch to it with `" <> p.tool <> " checkout " <> name <> "`")
     pure 0
   where
@@ -626,7 +635,7 @@ checkout p o = do
   when o.create do
     when (Array.elem o.name (branchNames vol)) $ fail ("branch '" <> o.name <> "' already exists")
     say ("Forking " <> cur <> " -> " <> o.name <> " ...")
-    void (Zfs.branch p.tool o.name (Just cur))
+    void (Zfs.branch (Identity.volumeName p.tool) o.name (Just cur))
   unless (o.create || Array.elem o.name (branchNames vol)) $
     fail ("no branch '" <> o.name <> "' (`" <> p.tool <> " branch` lists them; `checkout -b " <> o.name <> "` creates it)")
   if o.name == cur then say ("already on '" <> o.name <> "'") $> 0
@@ -656,8 +665,8 @@ checkout p o = do
         when m.running do
           say ("Stopping " <> p.tool <> " ...")
           void (B.stop box)
-        for_ (mountedBranch vol) \b -> void (Zfs.detach (Zfs.target p.tool (Just b)) m.id)
-        _ <- Zfs.attachAt (Zfs.target p.tool (Just o.name)) m.id (Just (p.dataDir os))
+        for_ (mountedBranch vol) \b -> void (Zfs.detach (Zfs.target (Identity.volumeName p.tool) (Just b)) m.id)
+        _ <- Zfs.attachAt (Zfs.target (Identity.volumeName p.tool) (Just o.name)) m.id (Just (p.dataDir os))
         liftEffect (State.save p.tool st { branch = o.name })
         when m.running do
           say ("Starting " <> p.tool <> " on branch " <> o.name <> " ...")

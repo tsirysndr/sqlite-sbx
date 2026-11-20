@@ -70,3 +70,12 @@ foreign import mkdirp :: String -> Effect Unit
 -- | The host, named the way release assets usually are.
 foreign import platform :: Effect { os :: String, arch :: String }
 foreign import listDir :: String -> Effect (Array String)
+
+-- | Kill gvproxy processes holding the host port whose bsdkrun is gone;
+-- | the pids removed.
+foreign import reapOrphanGvproxies :: Int -> Effect (Array Int)
+
+-- | Whether stdout is a terminal that wants colour.
+foreign import colorOutput :: Effect Boolean
+-- | Wrap text in an SGR code (`"36"` is teal).
+foreign import ansi :: String -> String -> String

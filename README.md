@@ -3,14 +3,15 @@
 SQLite in a [bsdkrun](https://github.com/tsirysndr/bsdkrun) microVM, with
 **branchable data**: the database lives on a ZFS branch you fork copy-on-write,
 switch between, and throw away, like `git branch` for your database. Since
-SQLite has no server, the Linux guest runs [libSQL
+SQLite has no server, the sandbox runs [libSQL
 server](https://github.com/tursodatabase/libsql) (`sqld`, Turso's SQLite fork)
 over the branch, so Drizzle Studio and drizzle-kit on the host reach it over
-HTTP, while `sqlite3` and [litecli](https://litecli.com) open the file inside
-the guest.
+HTTP, while `sqlite3` and [litecli](https://litecli.com) open the file next to
+it. On Linux that is the official `libsql-server` image as a container in
+bsdkrun's shared Docker engine VM.
 
 ```sh
-sqlite-sbx start                   # Ubuntu VM with sqld, port 8080 on 127.0.0.1
+sqlite-sbx start                   # sqld in a container, port 8080 on 127.0.0.1
 sqlite-sbx checkout -b feature     # fork the data, mount the fork
 sqlite-sbx drizzle push            # try a schema change on it
 sqlite-sbx studio                  # look at it in Drizzle Studio
@@ -86,8 +87,8 @@ Every command has `--help`.
 ## Starting
 
 ```sh
-sqlite-sbx start                                # linux, ubuntu:24.04 + sqld
-sqlite-sbx start linux debian:bookworm-slim     # any Debian/Ubuntu-family image (apt)
+sqlite-sbx start                                # linux, ghcr.io/tursodatabase/libsql-server:latest
+sqlite-sbx start linux 0.24.33                  # any tag of that image, or a full image reference
 sqlite-sbx start --db app                       # names the database (default: sqlite)
 sqlite-sbx start freebsd 15.1                   # sqlite3 + litecli from pkg; no server
 sqlite-sbx start netbsd                         # sqlite3 + litecli from pkgsrc; no server
@@ -102,16 +103,19 @@ sqlite-sbx start netbsd                         # sqlite3 + litecli from pkgsrc;
 | `--branch, -b BRANCH` | the current one | data branch to mount |
 | `--size SIZE` | 10G | data volume size when it is created (sparse) |
 
-There are no credentials: sqld runs without authentication, bound to the VM
-and reachable only through the forwarded port on 127.0.0.1.
+There are no credentials: sqld runs without authentication and is reachable
+only through the published port on 127.0.0.1.
 
-**Linux.** The guest boots a plain image and idles; a provisioning script,
-run on every start, installs `sqlite3`, `litecli` (via pipx) and sqld 0.24.32
-from libSQL's releases the first time (about a minute and a half, kept on the
-rootfs volume), then starts sqld on the data branch. The official
-`libsql-server` image is not used: it is Debian 11 with stale apt sources, which
-can install neither litecli nor the ZFS userland bsdkrun needs for the data
-branch.
+**Linux.** The server is a container in bsdkrun's shared Docker engine VM
+(`bsdkrun-docker`), not a VM of its own: one VM serves every Linux sandbox on
+the host. `start` creates the engine the first time, attaches the data volume
+to it (a new disk needs the engine restarted once; its other containers come
+back by themselves), and runs the official `libsql-server` image with the
+branch bind-mounted at `/var/lib/sqld` and sqld pointed at `NAME` under it.
+That image ships no CLIs, so `sqlite3` and `litecli` run in a small helper
+image (`sqlite-sbx-tools`, Alpine with both) built in the engine the first
+time and started with the same branch mounted. `--cpus` and `--mem` size a
+BSD VM and are not applied to the container.
 
 **FreeBSD and NetBSD.** No sqld package exists, so these guests only provide
 the file (`/var/db/sqlite/NAME.db`, created with WAL journaling) and the
@@ -167,7 +171,7 @@ const db = createClient({ url: "http://127.0.0.1:8080" });
 sqlite-sbx sqlite3                  # sqlite3 on the file, inside the VM
 sqlite-sbx litecli                  # litecli on the file, inside the VM
 sqlite-sbx url                      # http://127.0.0.1:8080
-sqlite-sbx ssh                      # a shell in the VM
+sqlite-sbx ssh                      # a shell in the VM, or in the sqld container on Linux
 ```
 
 sqld keeps the database at `/var/lib/sqld/NAME/dbs/default/data` in WAL mode;
@@ -180,8 +184,8 @@ Prefer Studio or the HTTP client for writes while the server is up.
 | --- | --- |
 | `~/.config/sqlite-sbx/state.json` | OS, version, port, database, branch, resources |
 | `~/.config/sqlite-sbx/drizzle.config.ts` | written by `studio` / `drizzle` |
-| `bsdkrun ps -a`, `bsdkrun zfs ls sqlite-sbx`, `bsdkrun volume ls` | the VM, the data volume and the rootfs volume |
-| `/var/lib/sqld` (Linux), `/var/db/sqlite` (BSD) | the branch's mountpoint in the guest |
+| `bsdkrun ps -a`, `bsdkrun zfs ls sqlite-sbx`, `bsdkrun docker ps` | the VM or the container, and the data volume |
+| `/mnt/sqlite-sbx-BRANCH` in the engine, `/var/lib/sqld` in the container (Linux); `/var/db/sqlite` (BSD) | the branch's mountpoint |
 
 `sqlite-sbx destroy` removes all of it after confirmation (`--yes` to skip).
 

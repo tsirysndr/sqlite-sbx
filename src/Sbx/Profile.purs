@@ -63,7 +63,9 @@ type Profile =
   , hasCredentials :: Boolean -- ^ whether --user/--password mean anything
   , defaults :: Creds
   , dataDir :: Os -> String -- ^ where the ZFS branch is mounted (the data directory lives in it)
+  , rootDisk :: Os -> Maybe String -- ^ grow the BSD root disk to this size before first boot (packages install there; the data is on ZFS)
   , rootfsVolume :: Boolean -- ^ keep the Linux rootfs on a named volume, so what provisioning installs survives restarts
+  , tools :: Maybe { image :: String, dockerfile :: String } -- ^ Linux: an image with the CLIs when the server image has none, built in the engine once; run with the branch mounted
   , env :: Creds -> Object String -- ^ the Linux image's environment
   , command :: Maybe (Array String) -- ^ override the Linux image's command
   , provision :: Os -> Maybe String -- ^ setup script run as root on every start; reads SBX_USER, SBX_PASSWORD, SBX_DB

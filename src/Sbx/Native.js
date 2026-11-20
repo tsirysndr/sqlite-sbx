@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { spawn, execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, readdirSync } from "node:fs";
@@ -71,3 +72,23 @@ export const platform = () => ({
   arch: process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "amd64" : process.arch,
 });
 export const listDir = dir => () => { try { return readdirSync(dir); } catch { return []; } };
+
+// gvproxy processes holding `port` whose spawning bsdkrun (the pid in their
+// socket directory) is gone: bsdkrun does not reap them when a machine stops
+// or exits, and the stale forward then blocks the next boot. Returns the pids
+// killed.
+export const reapOrphanGvproxies = port => () => {
+  const run = (cmd, args) => { try { return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); } catch { return ""; } };
+  const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+  const killed = [];
+  for (const pid of run("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]).split(/\s+/).filter(Boolean)) {
+    const m = /gvproxy.*bsdkrun-net-(\d+)/.exec(run("ps", ["-o", "command=", "-p", pid]));
+    if (!m || alive(Number(m[1]))) continue;
+    try { process.kill(Number(pid)); killed.push(Number(pid)); } catch {}
+  }
+  return killed;
+};
+
+// Colour only on a terminal, and not when NO_COLOR asks for plain output.
+export const colorOutput = () => Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+export const ansi = code => text => `\x1b[${code}m${text}\x1b[0m`;

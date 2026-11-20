@@ -4,9 +4,11 @@ module Sbx.App (run) where
 
 import Prelude
 import Bsdkrun as B
+import Bsdkrun.Docker as Docker
 import Bsdkrun.Exec as Exec
 import Bsdkrun.Host as Host
 import Bsdkrun.Options as Options
+import Bsdkrun.Port as Port
 import Bsdkrun.Sandbox as Sandbox
 import Bsdkrun.Types (Sandbox, SandboxInfo, ZfsVolumeInfo)
 import Bsdkrun.Zfs as Zfs
@@ -21,12 +23,13 @@ import Data.Nullable (toMaybe)
 import Data.String as String
 import Data.Time.Duration (Milliseconds(..))
 import Data.Tuple.Nested ((/\))
-import Effect.Aff (Aff, attempt, delay)
+import Effect.Aff (Aff, attempt, delay, finally, forkAff, killFiber)
 import Effect.Class (liftEffect)
 import Effect.Console (log)
 import Effect.Exception (error, message)
 import Foreign.Object as Object
 import Sbx.Cli (BranchOpts, Command(..), MigrateCmd(..), StartOpts)
+import Sbx.Engine as Engine
 import Sbx.Native as Native
 import Sbx.Profile (ClientCmd(..), Creds, FancyCmd(..), Migrations, Os(..), Profile, osName, parseOs)
 import Sbx.State (State)
@@ -38,6 +41,7 @@ run p = case _ of
   Stop -> stop p
   Status -> status p
   Shell -> shell p
+  Exec o -> exec p o
   Logs o -> logs p o
   Branch o -> branch p o
   Checkout o -> checkout p o
@@ -72,13 +76,48 @@ requireVolume p = findVolume p >>= maybe (fail ("no data volume yet — run `" <
 requireState :: Profile -> Aff State
 requireState p = liftEffect (State.load p.tool) >>= maybe (fail ("no sandbox yet — run `" <> p.tool <> " start`")) pure
 
-requireRunning :: Profile -> Aff { info :: SandboxInfo, box :: Sandbox, state :: State }
+-- | Where the server runs: a VM of its own (BSD guests), or a container in
+-- | the shared Docker engine VM (Linux).
+data Runtime = Vm Sandbox | Container String
+
+requireRunning :: Profile -> Aff { runtime :: Runtime, state :: State }
 requireRunning p = do
   state <- requireState p
-  info <- findMachine p >>= maybe (fail ("the VM is gone — run `" <> p.tool <> " start`")) pure
-  unless info.running $ fail (p.tool <> " is stopped — run `" <> p.tool <> " start`")
-  box <- B.get info.id
-  pure { info, box, state }
+  os <- stateOs state
+  case os of
+    Linux -> do
+      up <- Engine.isRunning p
+      unless up $ fail (p.tool <> " is stopped — run `" <> p.tool <> " start`")
+      pure { runtime: Container (Engine.containerName p), state }
+    _ -> do
+      info <- findMachine p >>= maybe (fail ("the VM is gone — run `" <> p.tool <> " start`")) pure
+      unless info.running $ fail (p.tool <> " is stopped — run `" <> p.tool <> " start`")
+      box <- B.get info.id
+      pure { runtime: Vm box, state }
+
+-- | Whether the server's VM or container is up.
+serverRunning :: Profile -> Aff Boolean
+serverRunning p = liftEffect (State.load p.tool) >>= case _ of
+  Just s | parseOs s.os == Just Linux -> Engine.isRunning p
+  _ -> findMachine p <#> maybe false _.running
+
+-- | A PTY session with the database: in the guest, or, when the server
+-- | image has no CLIs, in a helper container sharing the data branch.
+interactive :: Profile -> State -> Runtime -> Array String -> Aff Int
+interactive _ _ (Vm box) argv = Sandbox.execInteractive argv box
+interactive p st (Container name) argv = Engine.toolImage p >>= case _ of
+  Nothing -> Docker.dockerAttached ([ "exec", "-it", name ] <> argv)
+  Just image -> Docker.dockerAttached ([ "run", "--rm", "-it", "-v", Engine.mountPoint p st.branch <> ":" <> p.dataDir Linux, image ] <> argv)
+
+-- | A command with the terminal's stdin, stdout and stderr bound to it.
+attached :: Runtime -> Boolean -> Array String -> Aff Int
+attached (Vm box) tty argv = Sandbox.execAttached tty argv box
+attached (Container name) tty argv = Docker.dockerAttached ([ "exec", if tty then "-it" else "-i", name ] <> argv)
+
+-- | Exit status 0 of a command in the guest; false while it cannot run.
+probeIn :: Runtime -> Array String -> Aff Boolean
+probeIn (Vm box) argv = probe argv box
+probeIn (Container name) argv = Docker.docker ([ "exec", name ] <> argv) <#> (_.exitCode >>> eq 0)
 
 -- | The branch a volume has mounted (bsdkrun records it even for a stopped
 -- | holder); `main` on a volume nothing has imported yet.
@@ -102,7 +141,7 @@ stateOs st = maybe (fail ("state file names an unknown OS '" <> st.os <> "'")) p
 
 describe :: Profile -> State -> String
 describe p st = case parseOs st.os of
-  Just Linux -> "linux " <> p.image st.version
+  Just Linux -> "linux " <> p.image st.version <> " (container in " <> Docker.machineName <> ")"
   _ -> st.os <> (if st.version == "" then "" else " " <> st.version)
 
 -- | Exit status of a command in the guest; false while the agent is not up.
@@ -116,32 +155,131 @@ waitFor what seconds check = go 0
     | n >= seconds = fail (what <> " did not come up within " <> show seconds <> "s")
     | otherwise = check >>= \ok -> unless ok (delay (Milliseconds 1000.0) *> go (n + 1))
 
-waitReady :: Profile -> Os -> Creds -> Sandbox -> Aff Unit
-waitReady p os c box = do
+waitReady :: Profile -> Os -> Creds -> Runtime -> Aff Unit
+waitReady p os c rt = do
   say ("Waiting for " <> p.product <> " ...")
   waitFor p.product 180 do
-    alive <- B.isRunning box
-    unless alive $ fail ("the VM exited while " <> p.product <> " was starting; `" <> p.tool <> " log` and `" <> p.tool <> " log --boot` say why")
-    probe (p.ready os c) box
+    alive <- case rt of
+      Vm box -> B.isRunning box
+      Container _ -> Engine.isRunning p
+    unless alive $ fail case rt of
+      Vm _ -> "the VM exited while " <> p.product <> " was starting; `" <> p.tool <> " log` and `" <> p.tool <> " log --boot` say why"
+      Container _ -> "the container exited while " <> p.product <> " was starting; `" <> p.tool <> " log` says why"
+    probeIn rt (p.ready os c)
 
 -- | The profile's setup script, if any: idempotent, run as root through the
 -- | agent on every start (the first run installs packages).
-provision :: Profile -> Os -> Creds -> Sandbox -> Aff Unit
-provision p os c box = for_ (p.provision os) \script -> do
-  waitFor "the guest agent" 180 do
-    alive <- B.isRunning box
-    unless alive $ fail ("the VM exited at boot; `" <> p.tool <> " log --boot` says why")
-    probe [ "sh", "-c", "true" ] box
+provision :: Profile -> Boolean -> Os -> Creds -> Sandbox -> Aff Unit
+provision p stream os c box = for_ (p.provision os) \script -> do
+  waitAgent p os box
+  waitMounted p os box
   say ("Preparing " <> p.product <> " on " <> osName os <> " (the first time installs packages, which takes a minute or two) ...")
   let
     env = Object.fromFoldable [ "SBX_USER" /\ c.user, "SBX_PASSWORD" /\ c.password, "SBX_DB" /\ c.db ]
-    opts = Exec.options # Exec.withEnv env # Exec.withStdout Native.writeStdout # Exec.withStderr Native.writeStderr
+    opts = Exec.options # Exec.withEnv env
+      # (if stream then Exec.withStdout Native.writeStdout >>> Exec.withStderr Native.writeStderr else identity)
   r <- B.execWith [ "sh", "-c", script ] opts box
-  unless (r.exitCode == 0) $ fail ("provisioning failed with exit " <> show r.exitCode)
+  unless (r.exitCode == 0) do
+    -- Quiet starts keep the output for the failure report.
+    unless stream $ say (String.trim (r.stdout <> "\n" <> r.stderr))
+    fail ("provisioning failed with exit " <> show r.exitCode)
 
--- | Everything between a booted VM and a usable server.
-bringUp :: Profile -> Os -> Creds -> Sandbox -> Aff Unit
-bringUp p os c box = provision p os c box *> waitReady p os c box
+-- | Wait for the guest agent. A BSD guest whose root disk was just grown
+-- | resizes its file system and reboots (NetBSD does), which a detached
+-- | machine reports as a clean exit: boot it again, once.
+waitAgent :: Profile -> Os -> Sandbox -> Aff Unit
+waitAgent p os box = go (isJust (p.rootDisk os)) 0
+  where
+  go mayReboot n
+    | n >= 180 = fail "the guest agent did not come up within 180s"
+    | otherwise = B.status box >>= case _ of
+        Just m | m.running -> do
+          ok <- probe [ "sh", "-c", "true" ] box
+          unless ok (delay (Milliseconds 1000.0) *> go mayReboot (n + 1))
+        Just m | mayReboot, maybe true (_ == 0) (toMaybe m.exitCode) -> do
+          say "The guest grew its root disk and rebooted; starting it again ..."
+          for_ m.ports \f -> ensurePort p f.host
+          void (B.start box)
+          go false 0
+        _ -> fail ("the VM exited at boot; `" <> p.tool <> " log --boot` says why")
+
+-- | bsdkrun imports a machine's ZFS volumes from a hook that runs beside the
+-- | boot once the agent answers: wait for the data branch to be mounted. A
+-- | fresh NetBSD guest gets its ZFS modules installed by that hook and can
+-- | only load them at boot, so it is restarted once when the mount does not
+-- | come: right away once the modules are in place, else after the wait.
+waitMounted :: Profile -> Os -> Sandbox -> Aff Unit
+waitMounted p os box = go (os == NetBSD)
+  where
+  dir = p.dataDir os
+  mounted = probe [ "sh", "-c", "mount | grep -q ' on " <> dir <> " '" ] box
+  modulesInstalledButNotLoaded = do
+    m <- B.status box
+    prepared <- maybe (pure false) (\i -> liftEffect (Native.fileExists (Native.pathJoin i.stateDir "zfs-netbsd-ready"))) m
+    if not prepared then pure false else not <$> probe [ "sh", "-c", "modstat | grep -q '^zfs '" ] box
+  go mayRestart = do
+    outcome <- attempt $ waitFor ("the data branch at " <> dir) 90 do
+      up <- mounted
+      if up then pure true
+      else if mayRestart then modulesInstalledButNotLoaded >>= \restart -> if restart then throwError (error "restart") else pure false
+      else pure false
+    case outcome of
+      Right _ -> pure unit
+      Left e
+        | mayRestart -> do
+            say "NetBSD now loads ZFS at boot: restarting the VM to import the data branch ..."
+            void (B.stop box)
+            B.status box >>= \m -> for_ m \i -> for_ i.ports \f -> ensurePort p f.host
+            void (B.start box)
+            waitAgent p os box
+            go false
+        | otherwise -> throwError e
+
+-- | The engine mirrors a container's published port onto the host a moment
+-- | after the container starts: wait for it, so `ready` means reachable.
+waitHostPort :: Int -> Aff Unit
+waitHostPort port = waitFor ("host port " <> show port) 30 (not <$> Port.isFreeOn "127.0.0.1" port)
+
+-- | The forwarded host port must be free before the VM boots. A gvproxy left
+-- | behind by a machine that is gone (bsdkrun does not reap it on stop or
+-- | exit) is removed; anything else is reported with a way out.
+ensurePort :: Profile -> Int -> Aff Unit
+ensurePort p port = do
+  -- A forward the engine just withdrew (its container was removed up to
+  -- fifteen seconds ago) takes that long to let go of the port.
+  free <- settle 40
+  unless free do
+    reaped <- liftEffect (Native.reapOrphanGvproxies port)
+    unless (Array.null reaped) $ say ("Port " <> show port <> " was held by a gvproxy left behind by a machine that is gone (pid " <> String.joinWith ", " (map show reaped) <> "); removed it")
+    delay (Milliseconds 500.0)
+    free' <- Port.isFreeOn "127.0.0.1" port
+    unless free' $ fail ("host port " <> show port <> " is in use; pick another with `" <> p.tool <> " start --port PORT`")
+  where
+  settle n = do
+    free <- Port.isFreeOn "127.0.0.1" port
+    if free || n == 0 then pure free else delay (Milliseconds 500.0) *> settle (n - 1)
+
+-- | Everything between a booted VM and a usable server. With `stream`, the
+-- | provisioning output shows on the terminal; `start -d` turns that off.
+bringUp :: Profile -> Boolean -> Os -> Creds -> Sandbox -> Aff Unit
+bringUp p stream os c box = provision p stream os c box *> waitReady p os c (Vm box)
+
+-- | Run an action while the VM console streams to the terminal (`start -d`
+-- | skips it): everything the console holds for a VM just created, only what
+-- | comes next for a restart, so the previous boot is not replayed. The
+-- | follower is killed once the action is over.
+withConsole :: Boolean -> Boolean -> Sandbox -> Aff Unit -> Aff Unit
+withConsole false _ _ act = act
+withConsole true fromStart box act = do
+  follower <- forkAff (void (attempt (Sandbox.streamConsole fromStart box)))
+  finally (killFiber (error "console stream closed") follower) act
+
+-- | The same for a container: its log follows on the terminal meanwhile.
+withContainerLogs :: Boolean -> Profile -> Aff Unit -> Aff Unit
+withContainerLogs false _ act = act
+withContainerLogs true p act = do
+  follower <- forkAff (void (attempt (Docker.dockerAttached [ "logs", "-f", Engine.containerName p ])))
+  finally (killFiber (error "log stream closed") follower) act
 
 ready :: Profile -> State -> Aff Unit
 ready p st = do
@@ -156,8 +294,67 @@ rootfsVolume p = p.tool <> "-rootfs"
 start :: Profile -> StartOpts -> Aff Int
 start p o = do
   st <- liftEffect (State.load p.tool)
+  for_ st \s -> for_ o.os \os -> when (osName os /= s.os) $ fail ("this sandbox runs " <> s.os <> ", not " <> osName os <> "; `" <> p.tool <> " destroy` to start over")
+  let os = fromMaybe Linux ((st >>= _.os >>> parseOs) <|> o.os)
+  if os == Linux then startLinux p o st else startVm p o st
+
+-- | Linux: the server is a container in the shared engine VM, recreated
+-- | from the recorded settings whenever anything about it changes; the
+-- | container is disposable, the data branch is not.
+startLinux :: Profile -> StartOpts -> Maybe State -> Aff Int
+startLinux p o previous = do
+  legacy <- findMachine p
+  for_ legacy \m -> fail ("a '" <> p.tool <> "' VM (" <> m.id <> ") exists from a version that gave Linux its own VM; `" <> p.tool <> " destroy`, then start again")
+  for_ previous \s -> do
+    for_ o.version \v -> when (v /= s.version) $ fail ("this sandbox was created with version '" <> s.version <> "'; `" <> p.tool <> " destroy` to change it")
+    when (isJust o.user || isJust o.password || isJust o.db) $ say "note: credentials and the database were set when the data was initialised; the flags are ignored"
+  let
+    version = fromMaybe p.defaultTag (map _.version previous <|> o.version)
+    c = case previous of
+      Just s -> creds s
+      Nothing -> { user: fromMaybe p.defaults.user o.user, password: fromMaybe p.defaults.password o.password, db: fromMaybe p.defaults.db o.db }
+    port = fromMaybe (maybe p.guestPort _.port previous) o.port
+    cpus = fromMaybe (maybe 2 _.cpus previous) o.cpus
+    mem = fromMaybe (maybe 1024 _.mem previous) o.mem
+    size = fromMaybe "10G" o.size
+  vol <- findVolume p >>= case _ of
+    Just v -> pure v
+    Nothing -> do
+      say ("Creating data volume '" <> p.tool <> "' (" <> size <> ", sparse) ...")
+      _ <- Zfs.create p.tool (Just size)
+      findVolume p >>= maybe (fail "the volume was created but does not show up") pure
+  cur <- currentBranch p
+  let branchName = fromMaybe cur o.branch
+  unless (Array.elem branchName (branchNames vol)) $
+    fail ("no branch '" <> branchName <> "'; branches: " <> String.joinWith ", " (branchNames vol))
+  let st = { os: "linux", version, port, user: c.user, password: c.password, db: c.db, branch: branchName, cpus, mem }
+  running <- Engine.isRunning p
+  let unchanged = maybe false (\s -> s.port == port && s.branch == branchName && branchName == cur) previous
+  when (isJust o.cpus || isJust o.mem) $ say ("note: on Linux --cpus/--mem do not limit the container; the engine VM is sized with `bsdkrun docker start --cpus N --mem M`")
+  if running && unchanged then do
+    say (p.tool <> " is already running (container in " <> Docker.machineName <> ", " <> p.image version <> ")")
+    ready p st
+    pure 0
+  else do
+    say ("Starting " <> p.product <> " " <> p.image version <> " as container '" <> Engine.containerName p <> "' in the Docker engine VM, branch " <> branchName <> " at " <> Engine.mountPoint p branchName <> " ...")
+    -- The engine first: a stopped one hides the old container, which must
+    -- go before the branch can move and before its name is reused.
+    Engine.ensureEngine
+    Engine.removeContainer p
+    Engine.ensureAttached p vol branchName
+    ensurePort p port
+    liftEffect (State.save p.tool st)
+    Engine.pullImage p st (not o.detach)
+    Engine.runContainer p st c
+    withContainerLogs (not o.detach) p (waitReady p Linux c (Container (Engine.containerName p)))
+    waitHostPort port
+    ready p st
+    pure 0
+
+startVm :: Profile -> StartOpts -> Maybe State -> Aff Int
+startVm p o saved = do
   mm <- findMachine p
-  case mm, st of
+  case mm, saved of
     Just m, Just s
       | m.running && (o.port == Nothing || o.port == Just s.port) -> do
           say (p.tool <> " is already running (" <> m.id <> ", " <> describe p s <> ")")
@@ -193,14 +390,16 @@ start p o = do
                 void (B.update cpus mem box)
                 liftEffect (State.save p.tool s { cpus = cpus, mem = mem })
               say ("Starting " <> p.tool <> " (" <> m.id <> ") ...")
-              void (B.start box)
               s' <- requireState p
               os <- stateOs s'
-              bringUp p os (creds s') box
+              ensurePort p s'.port
+              withConsole (not o.detach) false box do
+                void (B.start box)
+                bringUp p (not o.detach) os (creds s') box
               ready p s'
               pure 0
     Just m, Nothing -> fail ("a machine named '" <> p.tool <> "' exists (" <> m.id <> ") but this tool did not record it; remove it with `bsdkrun rm -f " <> m.id <> "` or `" <> p.tool <> " destroy`")
-    Nothing, _ -> create st o
+    Nothing, _ -> create saved o
   where
   create previous o' = do
     let
@@ -222,12 +421,13 @@ start p o = do
       fail ("no branch '" <> branchName <> "'; branches: " <> String.joinWith ", " (branchNames vol))
     let
       bsdVersion = if version == "" then identity else Options.withVersion version
+      rootDisk os' = maybe identity Options.withDiskSize (p.rootDisk os')
       base = case os of
         Linux -> Options.linux (p.image version) # Options.withEnv (p.env c)
           # (if p.rootfsVolume then Options.withVolume (rootfsVolume p) else identity)
           # maybe identity Options.withCommand p.command
-        FreeBSD -> Options.freebsd # bsdVersion
-        NetBSD -> Options.netbsd # bsdVersion
+        FreeBSD -> Options.freebsd # bsdVersion # rootDisk FreeBSD
+        NetBSD -> Options.netbsd # bsdVersion # rootDisk NetBSD
       opts = base
         # Options.withName p.tool
         # Options.withCpus cpus
@@ -236,15 +436,29 @@ start p o = do
         # Options.withZfs [ Zfs.target p.tool (Just branchName) <> ":" <> p.dataDir os ]
       st = { os: osName os, version, port, user: c.user, password: c.password, db: c.db, branch: branchName, cpus, mem }
     say ("Creating " <> describe p st <> " VM '" <> p.tool <> "' with branch " <> branchName <> " at " <> p.dataDir os <> " (" <> show cpus <> " vCPU, " <> show mem <> " MiB) ...")
+    ensurePort p port
     box <- B.create opts
     liftEffect (State.save p.tool st)
     say ("VM " <> B.sandboxId box <> " is up")
-    bringUp p os c box
+    withConsole (not o'.detach) true box (bringUp p (not o'.detach) os c box)
     ready p st
     pure 0
 
 stop :: Profile -> Aff Int
-stop p = findMachine p >>= case _ of
+stop p = liftEffect (State.load p.tool) >>= case _ of
+  Just s | parseOs s.os == Just Linux -> do
+    up <- Engine.isRunning p
+    if not up then say (p.tool <> " is already stopped") $> 0
+    else do
+      say ("Stopping container '" <> Engine.containerName p <> "' ...")
+      r <- Docker.docker [ "stop", Engine.containerName p ]
+      unless (r.exitCode == 0) $ fail ("docker stop: " <> String.trim r.stderr)
+      say "stopped"
+      pure 0
+  _ -> stopVm p
+
+stopVm :: Profile -> Aff Int
+stopVm p = findMachine p >>= case _ of
   Nothing -> say ("nothing to stop: no " <> p.tool <> " VM") $> 0
   Just m
     | not m.running -> say (p.tool <> " is already stopped") $> 0
@@ -259,23 +473,50 @@ status p = do
   st <- liftEffect (State.load p.tool)
   mm <- findMachine p
   vol <- findVolume p
-  case st, mm of
-    Nothing, Nothing -> say ("no sandbox yet — run `" <> p.tool <> " start`") $> 0
-    _, _ -> do
-      let
-        row k v = say ("  " <> String.take 10 (k <> "          ") <> v)
-        portOf s = "127.0.0.1:" <> show s.port <> " -> " <> show p.guestPort
-      say p.tool
-      case mm of
-        Nothing -> row "vm" "not created (state recorded; `start` recreates it)"
-        Just m -> row "vm" (m.id <> " " <> (if m.running then "running" else "stopped") <> ", " <> maybe m.image (describe p) st <> ", " <> show m.cpus <> " vCPU / " <> show m.mem <> " MiB")
-      for_ st \s -> row "port" (portOf s)
+  tint <- liftEffect Native.colorOutput
+  let
+    row k v = say ("  " <> String.take 10 (k <> "          ") <> v)
+    portOf s = "127.0.0.1:" <> show s.port <> " -> " <> show p.guestPort
+    paint code s = if tint then Native.ansi code s else s
+    upOrDown up = if up then paint "36" "RUNNING" else "STOPPED"
+    rest = do
       cur <- currentBranch p
       let names = maybe [ "main" ] branchNames vol
       row "branch" (cur <> if Array.length names > 1 then "  (" <> String.joinWith ", " names <> ")" else "")
       for_ vol \v -> row "volume" (v.name <> " " <> maybe "" (\s -> s <> " used") (toMaybe v.size) <> (if Array.null v.attachedTo then " (not attached)" else ""))
       for_ st \s -> when p.hasCredentials $ row "database" (s.db <> " as " <> s.user)
       for_ st \s -> row "url" (p.url (creds s) s.port)
+  case st, mm of
+    Nothing, Nothing -> say ("no sandbox yet — run `" <> p.tool <> " start`") $> 0
+    Just s, Nothing | parseOs s.os == Just Linux -> do
+      engine <- Docker.status
+      c <- Engine.container p
+      let up = maybe false (_.state >>> eq "running") c
+      say p.tool
+      row "status" (upOrDown up)
+      row "engine" (Docker.machineName <> " " <> (if engine.running then "RUNNING" else if isJust (toMaybe engine.machineId) then "STOPPED" else "not created"))
+      row "container" case c of
+        Nothing -> "not created (`" <> p.tool <> " start` creates it)"
+        Just k -> k.id <> ", " <> describe p s <> ", " <> k.status
+      row "port" (portOf s)
+      rest
+      when up do
+        ok <- probeIn (Container (Engine.containerName p)) (p.ready Linux (creds s))
+        row "server" (if ok then "accepting connections" else "not accepting connections yet")
+      pure 0
+    _, _ -> do
+      say p.tool
+      case mm of
+        Nothing -> do
+          row "status" "STOPPED"
+          row "vm" "not created (state recorded; `start` recreates it)"
+        Just m -> do
+          -- 143 is SIGTERM: what `stop` sends, not a failure.
+          let exited = maybe "" (\code -> if code == 0 || code == 143 then "" else " (exited with " <> show code <> ")") (toMaybe m.exitCode)
+          row "status" (upOrDown m.running <> (if m.running then "" else exited))
+          row "vm" (m.id <> ", " <> maybe m.image (describe p) st <> ", " <> show m.cpus <> " vCPU / " <> show m.mem <> " MiB")
+      for_ st \s -> row "port" (portOf s)
+      rest
       case st, mm of
         Just s, Just m | m.running -> do
           os <- stateOs s
@@ -286,15 +527,43 @@ status p = do
       pure 0
 
 shell :: Profile -> Aff Int
-shell p = requireRunning p >>= _.box >>> Sandbox.shell
+shell p = requireRunning p >>= _.runtime >>> case _ of
+  Vm box -> Sandbox.shell box
+  Container name -> Docker.dockerAttached [ "exec", "-it", name, "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh" ]
 
+exec :: Profile -> { tty :: Boolean, command :: Array String } -> Aff Int
+exec p o = do
+  when (Array.null o.command) $ fail ("nothing to run — `" <> p.tool <> " exec CMD...`")
+  requireRunning p >>= \r -> attached r.runtime o.tty o.command
+
+-- | The server's log: the VM console for a BSD guest, the container's for
+-- | Linux (`--boot` then means the engine VM's boot log).
 logs :: Profile -> { follow :: Boolean, boot :: Boolean } -> Aff Int
 logs p o = do
-  _ <- requireState p
-  m <- findMachine p >>= maybe (fail ("no VM — run `" <> p.tool <> " start`")) pure
-  box <- B.get m.id
-  if o.follow then Sandbox.followLogs o.boot box
-  else (B.logs o.boot box >>= say) $> 0
+  st <- requireState p
+  os <- stateOs st
+  case os of
+    Linux | not o.boot -> do
+      c <- Engine.container p
+      when (isNothing' c) $ fail ("no container — run `" <> p.tool <> " start`")
+      if o.follow then Docker.dockerAttached [ "logs", "-f", Engine.containerName p ]
+      else do
+        r <- Docker.docker [ "logs", Engine.containerName p ]
+        say (String.trim (r.stdout <> "\n" <> r.stderr)) $> r.exitCode
+    Linux -> do
+      engine <- Docker.status
+      id <- maybe (fail "the engine VM has not been created yet") pure (toMaybe engine.machineId)
+      box <- B.get id
+      if o.follow then Sandbox.followLogs true box else (B.logs true box >>= say) $> 0
+    _ -> do
+      m <- findMachine p >>= maybe (fail ("no VM — run `" <> p.tool <> " start`")) pure
+      box <- B.get m.id
+      if o.follow then Sandbox.followLogs o.boot box
+      else (B.logs o.boot box >>= say) $> 0
+  where
+  isNothing' = case _ of
+    Nothing -> true
+    Just _ -> false
 
 branch :: Profile -> BranchOpts -> Aff Int
 branch p o = case o.name, o.arg of
@@ -333,8 +602,10 @@ branch' p o = case o.name, o.delete of
     let from = fromMaybe cur o.from
     when (Array.elem name (branchNames vol)) $ fail ("branch '" <> name <> "' already exists")
     unless (Array.elem from (branchNames vol)) $ fail ("no branch '" <> from <> "' to fork from")
-    mm <- findMachine p
-    unless (maybe false _.running mm) $ say "(the VM is not running: a short-lived FreeBSD helper does the fork)"
+    holder <- liftEffect (State.load p.tool) >>= case _ of
+      Just s | parseOs s.os == Just Linux -> Engine.engineRunning
+      _ -> findMachine p <#> maybe false _.running
+    unless holder $ say "(the VM holding the volume is not running: a short-lived FreeBSD helper does the fork)"
     say ("Forking " <> from <> " -> " <> name <> " ...")
     _ <- Zfs.branch p.tool name (Just from)
     say ("Branch '" <> name <> "' created. Switch to it with `" <> p.tool <> " checkout " <> name <> "`")
@@ -355,6 +626,21 @@ checkout p o = do
   unless (o.create || Array.elem o.name (branchNames vol)) $
     fail ("no branch '" <> o.name <> "' (`" <> p.tool <> " branch` lists them; `checkout -b " <> o.name <> "` creates it)")
   if o.name == cur then say ("already on '" <> o.name <> "'") $> 0
+  else if os == Linux then do
+    running <- Engine.isRunning p
+    when running $ say ("Stopping container '" <> Engine.containerName p <> "' ...")
+    Engine.removeContainer p
+    vol' <- requireVolume p
+    Engine.ensureAttached p vol' o.name
+    let st' = st { branch = o.name }
+    liftEffect (State.save p.tool st')
+    when running do
+      say ("Starting " <> p.tool <> " on branch " <> o.name <> " ...")
+      Engine.runContainer p st' (creds st)
+      waitReady p Linux (creds st) (Container (Engine.containerName p))
+      waitHostPort st.port
+    say ("Switched to branch '" <> o.name <> "'")
+    pure 0
   else do
     mm <- findMachine p
     case mm of
@@ -372,7 +658,7 @@ checkout p o = do
         when m.running do
           say ("Starting " <> p.tool <> " on branch " <> o.name <> " ...")
           _ <- B.start box
-          bringUp p os (creds st) box
+          bringUp p false os (creds st) box
         say ("Switched to branch '" <> o.name <> "'")
     pure 0
 
@@ -384,10 +670,10 @@ url p = do
 
 client :: Profile -> Aff Int
 client p = do
-  { box, state: st } <- requireRunning p
+  { runtime, state: st } <- requireRunning p
   os <- stateOs st
   case p.client of
-    Guest argv -> Sandbox.execInteractive (argv os (creds st)) box
+    Guest argv -> interactive p st runtime (argv os (creds st))
     Host argv -> do
       node <- liftEffect Native.nodePath
       root <- liftEffect Native.toolRoot
@@ -406,10 +692,10 @@ pythonRunner = do
 
 fancy :: Profile -> Aff Int
 fancy p = do
-  { box, state: st } <- requireRunning p
+  { runtime, state: st } <- requireRunning p
   os <- stateOs st
   case p.fancy.cmd of
-    GuestTool argv -> Sandbox.execInteractive (argv os (creds st)) box
+    GuestTool argv -> interactive p st runtime (argv os (creds st))
     HostTool argv -> do
       runner <- pythonRunner
       Native.spawnInherit runner.cmd (runner.args <> argv (creds st) st.port) Object.empty
@@ -544,8 +830,8 @@ setup p = do
           say ("Downloading " <> asset <> " ...")
           Native.download asset dest
           say ("Installed " <> dest <> " — make sure ~/.local/bin is on your PATH")
-  mm <- findMachine p
-  if maybe false _.running mm then do
+  up <- serverRunning p
+  if up then do
     say ("Initialising " <> m.name <> " in the sandbox database ...")
     runMigrationTool p [ "init" ] Nothing
   else do
@@ -590,14 +876,26 @@ doctor p = do
         Just b -> Native.capture b [ "--version" ] <#> \r -> Just (String.trim (if r.stdout == "" then r.stderr else r.stdout))
         Nothing -> pure Nothing
       check m.name (ver <#> \v -> v <> maybe "" (" at " <> _) tool) ("not installed: `" <> p.tool <> " setup` installs it")
+  dockerCli <- liftEffect (Native.findExecutable "docker") <#> toMaybe
+  okDocker <- check "docker" dockerCli "the docker CLI is not on PATH; Linux sandboxes run in bsdkrun's Docker engine, driven by it (brew install docker)"
+  engine <- attempt Docker.status
+  _ <- check "engine" (Just (case engine of
+    Right e | e.running -> Docker.machineName <> " running, Docker " <> fromMaybe "?" (toMaybe e.version) <> ", " <> show (fromMaybe 0 (toMaybe e.containers)) <> " container(s)"
+    Right e | isJust (toMaybe e.machineId) -> Docker.machineName <> " stopped (a Linux `start` starts it)"
+    Right _ -> "none yet (a Linux `start` creates " <> Docker.machineName <> ")"
+    Left e -> "could not ask bsdkrun: " <> message e)) ""
   st <- liftEffect (State.load p.tool)
   mm <- findMachine p
   vol <- findVolume p
-  _ <- check "sandbox" (Just (case st, mm of
-    Nothing, Nothing -> "none yet (`" <> p.tool <> " start`)"
-    _, Just m -> "VM " <> m.id <> " " <> (if m.running then "running" else "stopped") <> maybe "" (\v -> ", volume with " <> show (Array.length (branchNames v)) <> " branch(es)") vol
-    Just _, Nothing -> "state recorded but no VM (`" <> p.tool <> " start` recreates it)")) ""
-  pure (if okBin && okProbe && okNode && okKit && okTool then 0 else 1)
+  container <- if maybe false (\s -> parseOs s.os == Just Linux) st then Engine.container p else pure Nothing
+  let volumeNote = maybe "" (\v -> ", volume with " <> show (Array.length (branchNames v)) <> " branch(es)") vol
+  _ <- check "sandbox" (Just (case st, mm, container of
+    Nothing, Nothing, _ -> "none yet (`" <> p.tool <> " start`)"
+    _, Just m, _ -> "VM " <> m.id <> " " <> (if m.running then "running" else "stopped") <> volumeNote
+    Just _, Nothing, Just c -> "container " <> c.id <> " " <> c.state <> volumeNote
+    Just s, Nothing, Nothing | parseOs s.os == Just Linux -> "state recorded but no container (`" <> p.tool <> " start` recreates it)" <> volumeNote
+    Just _, Nothing, Nothing -> "state recorded but no VM (`" <> p.tool <> " start` recreates it)")) ""
+  pure (if okBin && okProbe && okNode && okKit && okTool && okDocker then 0 else 1)
   where
   check name result hint = case result of
     Just detail -> say ("  ok   " <> pad name <> detail) $> true
@@ -609,10 +907,12 @@ destroy p o = do
   st <- liftEffect (State.load p.tool)
   mm <- findMachine p
   vol <- findVolume p
-  if Array.all isNothing' [ void st, void mm, void vol ] then say ("nothing to destroy: no " <> p.tool <> " sandbox") $> 0
+  container <- if maybe false (\s -> parseOs s.os == Just Linux) st then Engine.container p else pure Nothing
+  if Array.all isNothing' [ void st, void mm, void vol, void container ] then say ("nothing to destroy: no " <> p.tool <> " sandbox") $> 0
   else do
     say "This removes:"
     for_ mm \m -> say ("  VM " <> m.id <> " (" <> (if m.running then "running" else "stopped") <> ")")
+    for_ container \c -> say ("  container " <> c.id <> " in " <> Docker.machineName <> " (" <> c.state <> "; the engine itself stays)")
     for_ vol \v -> say ("  data volume '" <> v.name <> "' with branches " <> String.joinWith ", " (branchNames v) <> " — all data")
     rootfs <- Host.volumes <#> Array.find (_.name >>> eq (rootfsVolume p))
     for_ rootfs \v -> say ("  rootfs volume '" <> v.name <> "'")
@@ -632,7 +932,11 @@ destroy p o = do
           void (B.stop box)
         say "Removing the VM ..."
         void (B.remove true box)
+      for_ container \_ -> do
+        say "Removing the container ..."
+        Engine.removeContainer p
       for_ vol \v -> do
+        Engine.detachVolume p v
         say ("Destroying volume '" <> v.name <> "' ...")
         Zfs.destroy [ v.name ] true
       for_ rootfs \v -> do
